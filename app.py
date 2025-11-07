@@ -59,7 +59,10 @@ init_gsheets()
 # -----------------------------
 # FUNÇÕES DE DADOS (Sheets)
 # -----------------------------
+
+@st.cache_data(ttl=300)  # cache por 5 minutos
 def carregar_dados():
+    """Lê os dados do Google Sheets e mantém cache temporário para evitar excesso de requisições"""
     try:
         records = WORKSHEET.get_all_records()
     except Exception as e:
@@ -71,7 +74,7 @@ def carregar_dados():
         try:
             WORKSHEET.clear()
             WORKSHEET.update([COLUNAS])
-        except:
+        except Exception:
             pass
         return df
 
@@ -82,13 +85,15 @@ def carregar_dados():
     df = df[COLUNAS]
     return df
 
+
 def salvar_dados(df):
+    """Grava os dados no Google Sheets (sem cache)"""
     try:
         df2 = df.copy()
-        df2 = df2[COLUNAS]
-        df2 = df2.fillna("")
+        df2 = df2[COLUNAS].fillna("")
         WORKSHEET.clear()
         WORKSHEET.update([df2.columns.values.tolist()] + df2.values.tolist())
+        st.cache_data.clear()  # limpa cache para forçar recarregamento atualizado
     except Exception as e:
         st.error("Erro ao salvar dados na planilha: " + str(e))
 

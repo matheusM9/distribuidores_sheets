@@ -59,7 +59,6 @@ init_gsheets()
 # -----------------------------
 # FUNÇÕES DE DADOS (Sheets)
 # -----------------------------
-
 @st.cache_data(ttl=300)  # cache por 5 minutos
 def carregar_dados():
     """Lê os dados do Google Sheets e mantém cache temporário para evitar excesso de requisições"""
@@ -199,53 +198,124 @@ def cor_distribuidor(nome):
     h += 0x111111
     return f"#{h:06X}"
 
-def criar_mapa(df, filtro_distribuidores=None):
-    mapa = folium.Map(location=[-14.2350, -51.9253], zoom_start=5, tiles="CartoDB positron")
+# utility: recursivamente extrai coordenadas (lon, lat) de um GeoJSON (suporta MultiPolygon/Polygon)
+def _extract_coords_from_geojson_coords(coords, out):
+    if isinstance(coords[0], (float, int)):
+        # é um ponto [lon, lat]
+        out.append((coords[1], coords[0]))  # retornamos (lat, lon)
+    else:
+        for c in coords:
+            _extract_coords_from_geojson_coords(c, out)
+
+def _centroid_and_bbox_from_feature(feature):
+    coords = []
+    geom = feature.get("geometry", {})
+    if not geom:
+        return None, None
+    _extract_coords_from_geojson_coords(geom.get("coordinates", []), coords)
+    if not coords:
+        return None, None
+    lats = [c[0] for c in coords]
+    lons = [c[1] for c in coords]
+    centroid = [sum(lats) / len(lats), sum(lons) / len(lons)]
+    bbox = [min(lats), min(lons), max(lats), max(lons)]
+    return centroid, bbox
+
+def _state_feature_by_sigla(geojson_estados, sigla):
+    for feat in geojson_estados.get("features", []):
+        props = feat.get("properties", {})
+        # Tentar combinar pela sigla, depois pelo nome
+        if props.get("sigla") == sigla or props.get("UF") == sigla or props.get("ESTADO") == sigla:
+            return feat
+        # alguns datasets usam 'nome'
+        nome = props.get("nome") or props.get("NOME")
+        if nome and nome.endswith(f" - {sigla}") is False:
+            # não faz nada; mantemos tentativa por sigla
+            pass
+    # fallback: procurar por sigla no nome (caso proprietários tenham nomes unificados)
+    for feat in geojson_estados.get("features", []):
+        props = feat.get("properties", {})
+        nome = props.get("nome") or props.get("NOME") or ""
+        if sigla in nome:
+            return feat
+    return None
+
+def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
+    # centro padrão do Brasil
+    default_location = [-14.2350, -51.9253]
+    zoom_start = 5
+
+    if zoom_to_state and isinstance(zoom_to_state, dict):
+        center = zoom_to_state.get("center", default_location)
+        zoom_start = zoom_to_state.get("zoom", 6)
+        mapa = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron")
+    else:
+        mapa = folium.Map(location=default_location, zoom_start=zoom_start, tiles="CartoDB positron")
+
     for _, row in df.iterrows():
         if filtro_distribuidores and row["Distribuidor"] not in filtro_distribuidores:
             continue
-        cidade = row["Cidade"]
-        estado = row["Estado"]
-        geojson = obter_geojson_cidade(cidade, estado)
-        cor = cor_distribuidor(row["Distribuidor"])
+        cidade = row.get("Cidade", "")
+        estado = row.get("Estado", "")
+        geojson = None
+        try:
+            if cidade and estado:
+                geojson = obter_geojson_cidade(cidade, estado)
+        except:
+            geojson = None
+        cor = cor_distribuidor(row.get("Distribuidor", ""))
         if geojson and "features" in geojson:
-            folium.GeoJson(
-                geojson,
-                style_function=lambda feature, cor=cor: {
-                    "fillColor": cor,
-                    "color": "#666666",
-                    "weight": 1.2,
-                    "fillOpacity": 0.55
-                },
-                tooltip=f"{row['Distribuidor']} ({cidade} - {estado})"
-            ).add_to(mapa)
+            try:
+                folium.GeoJson(
+                    geojson,
+                    style_function=lambda feature, cor=cor: {
+                        "fillColor": cor,
+                        "color": "#666666",
+                        "weight": 1.2,
+                        "fillOpacity": 0.55
+                    },
+                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})"
+                ).add_to(mapa)
+            except:
+                pass
         else:
             try:
-                lat = float(row["Latitude"]) if row["Latitude"] not in (None, "") else -14.2350
-                lon = float(row["Longitude"]) if row["Longitude"] not in (None, "") else -51.9253
+                lat_raw = row.get("Latitude", "")
+                lon_raw = row.get("Longitude", "")
+                lat = float(lat_raw) if lat_raw not in (None, "", " ") else None
+                lon = float(lon_raw) if lon_raw not in (None, "", " ") else None
+                if lat is None or lon is None:
+                    # se não tem coords válidas, pulamos (não colocamos no centro do brasil por padrão)
+                    continue
                 folium.CircleMarker(
                    location=[lat, lon],
-                   radius=12,
+                   radius=8,
                    color="#333333",
                    fill=True,
                    fill_color=cor,
-                   fill_opacity=0.6,
-                   popup=f"{row['Distribuidor']} ({cidade} - {estado})"
+                   fill_opacity=0.8,
+                   popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})"
                 ).add_to(mapa)
             except:
                 continue
+
+    # adicionar contornos dos estados (se disponível)
     geo_estados = obter_geojson_estados()
     if geo_estados:
-        folium.GeoJson(
-            geo_estados,
-            name="Divisas Estaduais",
-            style_function=lambda f: f.get("properties", {}).get("style", {
-                "color": "#000000",
-                "weight": 3,
-                "fillOpacity": 0
-            }),
-            tooltip=folium.GeoJsonTooltip(fields=["nome"], aliases=["Estado:"])
-        ).add_to(mapa)
+        try:
+            folium.GeoJson(
+                geo_estados,
+                name="Divisas Estaduais",
+                style_function=lambda f: f.get("properties", {}).get("style", {
+                    "color": "#000000",
+                    "weight": 3,
+                    "fillOpacity": 0
+                }),
+                tooltip=folium.GeoJsonTooltip(fields=["nome"], aliases=["Estado:"])
+            ).add_to(mapa)
+        except:
+            pass
+
     folium.LayerControl().add_to(mapa)
     return mapa
 
@@ -415,39 +485,135 @@ elif choice == "Lista / Editar / Excluir":
                     st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
-# MAPA COM AUTOCOMPLETE E LIMPAR BUSCA
+# MAPA (filtros na sidebar, sem lista na área principal)
 # =============================
 elif choice == "Mapa":
     st.subheader("🗺️ Mapa de Distribuidores")
-    distribuidores = st.multiselect("Filtrar Distribuidores", st.session_state.df["Distribuidor"].unique())
-    st.markdown("### 🔎 Buscar Cidade")
+
+    # ---------------------
+    # SIDEBAR: filtros combinados
+    # ---------------------
+    st.sidebar.markdown("### 🔎 Filtros do Mapa")
+
+    # garantir chaves de session_state
+    if "estado_filtro" not in st.session_state:
+        st.session_state.estado_filtro = ""
+    if "cidade_busca" not in st.session_state:
+        st.session_state.cidade_busca = ""
+    if "distribuidores_selecionados" not in st.session_state:
+        st.session_state.distribuidores_selecionados = []
+
+    # Estado (com opção vazia)
+    estados = carregar_estados()
+    siglas = [e["sigla"] for e in estados]
+    estado_filtro = st.sidebar.selectbox("Filtrar por Estado", [""] + siglas, index=(0 if st.session_state.estado_filtro == "" else ([""] + siglas).index(st.session_state.estado_filtro)))
+    st.session_state.estado_filtro = estado_filtro
+
+    # Filtrar distribuidores (multiselect) - opções restritas ao estado se houver
+    distribuidores_opcoes = st.session_state.df["Distribuidor"].unique().tolist()
+    if estado_filtro:
+        distribuidores_opcoes = st.session_state.df[st.session_state.df["Estado"] == estado_filtro]["Distribuidor"].unique().tolist()
+    distribuidores_selecionados = st.sidebar.multiselect("Filtrar Distribuidores (opcional)", sorted(distribuidores_opcoes), default=st.session_state.distribuidores_selecionados)
+    st.session_state.distribuidores_selecionados = distribuidores_selecionados
+
+    # Busca por cidade (lista filtrada por estado se houver)
     todas_cidades = carregar_todas_cidades()
+    if estado_filtro:
+        todas_cidades = [c for c in todas_cidades if c.endswith(f" - {estado_filtro}")]
+    cidade_index = 0 if st.session_state.cidade_busca == "" else (todas_cidades.index(st.session_state.cidade_busca) + 1 if st.session_state.cidade_busca in todas_cidades else 0)
+    cidade_selecionada_sidebar = st.sidebar.selectbox("Buscar Cidade", [""] + todas_cidades, index=cidade_index)
+    if cidade_selecionada_sidebar:
+        st.session_state.cidade_busca = cidade_selecionada_sidebar
 
-    col1, col2 = st.columns([4,1])
-    with col1:
-        index_cidade = 0 if st.session_state.cidade_busca == "" else (todas_cidades.index(st.session_state.cidade_busca) + 1 if st.session_state.cidade_busca in todas_cidades else 0)
-        cidade_selecionada = st.selectbox("Digite o nome da cidade e selecione:", [""] + todas_cidades, index=index_cidade)
-    with col2:
-        if st.button("Limpar busca"):
-            st.session_state.cidade_busca = ""
-            cidade_selecionada = ""
+    # Botão limpar filtros: limpa tudo e rerun
+    if st.sidebar.button("Limpar filtros"):
+        st.session_state.estado_filtro = ""
+        st.session_state.distribuidores_selecionados = []
+        st.session_state.cidade_busca = ""
+        # forçar recarregamento
+        st.experimental_rerun()
 
-    if cidade_selecionada:
-        st.session_state.cidade_busca = cidade_selecionada
+    # ---------------------
+    # Aplicar filtros combinados ao dataframe
+    # ---------------------
+    df_filtro = st.session_state.df.copy()
+
+    if st.session_state.estado_filtro:
+        df_filtro = df_filtro[df_filtro["Estado"] == st.session_state.estado_filtro]
+
+    if st.session_state.distribuidores_selecionados:
+        df_filtro = df_filtro[df_filtro["Distribuidor"].isin(st.session_state.distribuidores_selecionados)]
 
     if st.session_state.cidade_busca:
-        cidade_nome, estado_sigla = st.session_state.cidade_busca.split(" - ")
-        df_cidade = st.session_state.df[
-            (st.session_state.df["Cidade"].str.lower() == cidade_nome.lower()) &
-            (st.session_state.df["Estado"].str.upper() == estado_sigla.upper())
-        ]
-        if df_cidade.empty:
-            st.warning(f"❌ Nenhum distribuidor encontrado em **{cidade_nome} - {estado_sigla}**.")
+        try:
+            cidade_nome, estado_sigla = st.session_state.cidade_busca.split(" - ")
+            df_filtro = df_filtro[
+                (df_filtro["Cidade"].str.lower() == cidade_nome.lower()) &
+                (df_filtro["Estado"].str.upper() == estado_sigla.upper())
+            ]
+        except Exception:
+            # formato inesperado: ignorar filtro de cidade
+            pass
+
+    # OBS: conforme solicitado, NÃO mostramos a tabela de distribuidores nesta aba, apenas o mapa.
+
+    # ---------------------
+    # Determinar zoom/centro de forma robusta (evitar Antártida)
+    # - 1) usar as coords dos distribuidores filtrados (se houver)
+    # - 2) senão, tentar o centróide do GeoJSON do estado (IBGE)
+    # - 3) senão, usar centro padrão do Brasil
+    # ---------------------
+    zoom_to_state = None
+    if st.session_state.estado_filtro:
+        # 1) tentar usar coords dos distribuidores do próprio estado (não apenas df_filtro)
+        df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
+        lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
+        lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
+        if not lats.empty and not lons.empty:
+            center_lat = float(lats.mean())
+            center_lon = float(lons.mean())
+            # calcular amplitude para ajustar zoom
+            lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
+            lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
+            span = max(lat_span, lon_span)
+            # heurística simples para zoom
+            if span < 0.2:
+                zoom = 11
+            elif span < 1.0:
+                zoom = 9
+            elif span < 3.0:
+                zoom = 8
+            else:
+                zoom = 6
+            zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
         else:
-            st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{cidade_nome} - {estado_sigla}**:")
-            st.dataframe(df_cidade[["Distribuidor","Contato","Email","Estado","Cidade"]], use_container_width=True)
-            mapa = criar_mapa(df_cidade)
-            st_folium(mapa, width=1200, height=700)
-    else:
-        mapa = criar_mapa(st.session_state.df, filtro_distribuidores=distribuidores if distribuidores else None)
-        st_folium(mapa, width=1200, height=700)
+            # 2) tentar centroid a partir do geojson dos estados (IBGE)
+            geo_estados = obter_geojson_estados()
+            if geo_estados:
+                feat = _state_feature_by_sigla(geo_estados, st.session_state.estado_filtro)
+                if feat:
+                    centroid_bbox = _centroid_and_bbox_from_feature(feat)
+                    if centroid_bbox:
+                        centroid, bbox = centroid_bbox
+                        # bbox = [min_lat, min_lon, max_lat, max_lon]
+                        lat_span = bbox[2] - bbox[0]
+                        lon_span = bbox[3] - bbox[1]
+                        span = max(lat_span, lon_span)
+                        if span < 0.2:
+                            zoom = 11
+                        elif span < 1.0:
+                            zoom = 9
+                        elif span < 3.0:
+                            zoom = 8
+                        else:
+                            zoom = 6
+                        zoom_to_state = {"center": centroid, "zoom": zoom}
+            # fallback robusto: centro do Brasil
+            if not zoom_to_state:
+                zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+
+    # ---------------------
+    # Criar e exibir o mapa com filtros aplicados
+    # ---------------------
+    mapa = criar_mapa(df_filtro, filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
+    st_folium(mapa, width=1200, height=700)

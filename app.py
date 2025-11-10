@@ -1,18 +1,19 @@
-# app.py
 # -------------------------------------------------------------
-# DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS) - VERSÃO COMPLETA
+# DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
 # -------------------------------------------------------------
-import os
-import json
-import re
-import requests
 import streamlit as st
+st.set_page_config(page_title="Distribuidores", layout="wide")
+
+import os
 import pandas as pd
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+import requests
+import json
 import bcrypt
+import re
 from streamlit_cookies_manager import EncryptedCookieManager
 
 # Google Sheets
@@ -21,38 +22,20 @@ from google.oauth2.service_account import Credentials
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
 
 # -----------------------------
-# CONFIGURAÇÕES GLOBAIS
-# -----------------------------
-st.set_page_config(page_title="Distribuidores", layout="wide")
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# -----------------------------
-# CONSTANTES
+# CONFIGURAÇÃO GOOGLE SHEETS
 # -----------------------------
 SHEET_ID = "1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k"
 SHEET_NAME = "Página1"
 COLUNAS = ["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Latitude", "Longitude"]
+
+# -----------------------------
+# Inicializar Google Sheets client
+# -----------------------------
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-USUARIOS_FILE = os.path.join(BASE_DIR, "usuarios.json")
-GEOJSON_CACHE_DIR = os.path.join(BASE_DIR, "geojson_cache")
-os.makedirs(GEOJSON_CACHE_DIR, exist_ok=True)
-
-# -----------------------------
-# INICIALIZAÇÃO COOKIES
-# -----------------------------
-cookies = EncryptedCookieManager(prefix="distribuidores_login", password="chave_secreta_segura_123")
-if not cookies.ready():
-    # Quando o cookies manager ainda não está pronto, o Streamlit deve esperar.
-    st.stop()
-
-# -----------------------------
-# FUNÇÕES GOOGLE SHEETS
-# -----------------------------
 GC = None
 WORKSHEET = None
 
 def init_gsheets():
-    """Inicializa client do Google Sheets via Service Account nos secrets"""
     global GC, WORKSHEET
     if "gcp_service_account" not in st.secrets:
         st.error("❌ Google Service Account não configurada nos Secrets do Streamlit Cloud.")
@@ -76,6 +59,7 @@ init_gsheets()
 # -----------------------------
 # FUNÇÕES DE DADOS (Sheets)
 # -----------------------------
+
 @st.cache_data(ttl=300)  # cache por 5 minutos
 def carregar_dados():
     """Lê os dados do Google Sheets e mantém cache temporário para evitar excesso de requisições"""
@@ -99,9 +83,8 @@ def carregar_dados():
         if col not in df.columns:
             df[col] = ""
     df = df[COLUNAS]
-    # Garantir tipos corretos
-    df[['Latitude','Longitude']] = df[['Latitude','Longitude']].apply(pd.to_numeric, errors='coerce')
     return df
+
 
 def salvar_dados(df):
     """Grava os dados no Google Sheets (sem cache)"""
@@ -110,16 +93,22 @@ def salvar_dados(df):
         df2 = df2[COLUNAS].fillna("")
         WORKSHEET.clear()
         WORKSHEET.update([df2.columns.values.tolist()] + df2.values.tolist())
-        # Limpar cache para garantir recarga na próxima leitura
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
+        st.cache_data.clear()  # limpa cache para forçar recarregamento atualizado
     except Exception as e:
         st.error("Erro ao salvar dados na planilha: " + str(e))
 
 # -----------------------------
-# UTILITÁRIOS (CAPITAIS / VALIDAÇÕES)
+# COOKIES (LOGIN PERSISTENTE)
+# -----------------------------
+cookies = EncryptedCookieManager(
+    prefix="distribuidores_login",
+    password="chave_secreta_segura_123"
+)
+if not cookies.ready():
+    st.stop()
+
+# -----------------------------
+# CAPITAIS BRASILEIRAS
 # -----------------------------
 CAPITAIS_BRASILEIRAS = [
     "Rio Branco-AC","Maceió-AL","Macapá-AP","Manaus-AM","Salvador-BA","Fortaleza-CE",
@@ -132,110 +121,76 @@ CAPITAIS_BRASILEIRAS = [
 def cidade_eh_capital(cidade, uf):
     return f"{cidade}-{uf}" in CAPITAIS_BRASILEIRAS
 
-def validar_telefone(tel):
-    padrao = r'^\(\d{2}\) \d{4,5}-\d{4}$'
-    return re.match(padrao, tel)
-
-def validar_email(email):
-    padrao = r'^[\w\.-]+@[\w\.-]+\.\w+$'
-    return re.match(padrao, email)
-
 # -----------------------------
-# IBGE / GEO (com cache local dos geojson)
+# FUNÇÕES AUXILIARES (IBGE + GEO)
 # -----------------------------
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def carregar_estados():
     url = "https://servicodados.ibge.gov.br/api/v1/localidades/estados"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            return sorted(resp.json(), key=lambda e: e['nome'])
-    except Exception:
-        pass
-    return []
+    resp = requests.get(url)
+    return sorted(resp.json(), key=lambda e: e['nome'])
 
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def carregar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            return sorted(resp.json(), key=lambda c: c['nome'])
-    except Exception:
-        pass
-    return []
+    resp = requests.get(url)
+    return sorted(resp.json(), key=lambda c: c['nome'])
 
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def carregar_todas_cidades():
     cidades = []
     estados = carregar_estados()
     for estado in estados:
         uf = estado["sigla"]
         url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-        try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                for c in resp.json():
-                    cidades.append(f"{c['nome']} - {uf}")
-        except Exception:
-            pass
-    return sorted(set(cidades))
+        resp = requests.get(url)
+        if resp.status_code == 200:
+            for c in resp.json():
+                cidades.append(f"{c['nome']} - {uf}")
+    return sorted(cidades)
 
-def _cache_file_for_city(cidade, estado_sigla):
-    # nome seguro para arquivo
-    safe_cidade = re.sub(r'[^A-Za-z0-9_-]', '_', cidade)
-    return os.path.join(GEOJSON_CACHE_DIR, f"{safe_cidade}_{estado_sigla}.json")
+def obter_coordenadas(cidade, estado):
+    geolocator = Nominatim(user_agent="distribuidores_app", timeout=5)
+    try:
+        location = geolocator.geocode(f"{cidade}, {estado}, Brasil")
+        if location:
+            return location.latitude, location.longitude
+        else:
+            return "", ""
+    except (GeocoderTimedOut, GeocoderUnavailable):
+        return "", ""
 
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def obter_geojson_cidade(cidade, estado_sigla):
-    """Obtém e cacheia o GeoJSON da cidade (cache local + cache_data streamlit)"""
-    cache_file = _cache_file_for_city(cidade, estado_sigla)
-
-    # Se já existe em cache local (arquivo)
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-
     cidades_data = carregar_cidades(estado_sigla)
-    cidade_info = next((c for c in cidades_data if c["nome"].lower() == cidade.lower()), None)
+    cidade_info = next((c for c in cidades_data if c["nome"] == cidade), None)
     if not cidade_info:
         return None
-
     geojson_url = f"https://servicodados.ibge.gov.br/api/v2/malhas/{cidade_info['id']}?formato=application/vnd.geo+json&qualidade=intermediaria"
     try:
-        resp = requests.get(geojson_url, timeout=10)
+        resp = requests.get(geojson_url, timeout=5)
         if resp.status_code == 200:
-            geojson = resp.json()
-            try:
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(geojson, f)
-            except Exception:
-                pass
-            return geojson
-    except Exception:
+            return resp.json()
+    except:
         pass
     return None
 
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def obter_geojson_estados():
-    """Retorna um GeoJSON com os limites dos estados (fonte alternativa mais estável)"""
-    url = "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/brazil-states.geojson"
+    url = "https://servicodados.ibge.gov.br/api/v2/malhas/?formato=application/vnd.geo+json&qualidade=simplificada&incluir=estados"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             geojson = resp.json()
-            # adicionar style básico nas properties para use posterior
-            for feat in geojson.get("features", []):
-                feat.setdefault("properties", {})["style"] = {
+            for feature in geojson.get("features", []):
+                feature["properties"]["style"] = {
                     "color": "#000000",
-                    "weight": 2,
+                    "weight": 3,
+                    "dashArray": "0",
                     "fillOpacity": 0
                 }
             return geojson
-    except Exception:
+    except:
         pass
     return None
 
@@ -244,112 +199,72 @@ def cor_distribuidor(nome):
     h += 0x111111
     return f"#{h:06X}"
 
-# -----------------------------
-# FUNÇÕES DE GEOLOCALIZAÇÃO (Nominatim)
-# -----------------------------
-def obter_coordenadas(cidade, estado):
-    geolocator = Nominatim(user_agent="distribuidores_app", timeout=6)
-    try:
-        location = geolocator.geocode(f"{cidade}, {estado}, Brasil")
-        if location:
-            return round(location.latitude, 6), round(location.longitude, 6)
-        else:
-            return "", ""
-    except (GeocoderTimedOut, GeocoderUnavailable):
-        return "", ""
-
-# -----------------------------
-# CRIAÇÃO DO MAPA (cache resource)
-# -----------------------------
-@st.cache_resource(show_spinner=False)
 def criar_mapa(df, filtro_distribuidores=None):
-    """Cria e retorna um objeto folium.Map. Cacheado em resource para performance."""
     mapa = folium.Map(location=[-14.2350, -51.9253], zoom_start=5, tiles="CartoDB positron")
-
-    # Adicionar limites dos estados (uma camada)
-    geo_estados = obter_geojson_estados()
-    if geo_estados:
-        folium.GeoJson(
-            geo_estados,
-            name="Divisas Estaduais",
-            style_function=lambda f: {"color": "#666666", "weight": 1.5, "fillOpacity": 0},
-            tooltip=folium.GeoJsonTooltip(fields=["name"], aliases=["Estado:"])
-        ).add_to(mapa)
-
-    # Adicionar cada distribuidor (preferir geojson da cidade quando houver)
     for _, row in df.iterrows():
         if filtro_distribuidores and row["Distribuidor"] not in filtro_distribuidores:
             continue
         cidade = row["Cidade"]
         estado = row["Estado"]
-        distribuidor = row["Distribuidor"]
-        cor = cor_distribuidor(distribuidor)
-
-        geojson = None
-        try:
-            if cidade and estado:
-                geojson = obter_geojson_cidade(cidade, estado)
-        except Exception:
-            geojson = None
-
+        geojson = obter_geojson_cidade(cidade, estado)
+        cor = cor_distribuidor(row["Distribuidor"])
         if geojson and "features" in geojson:
-            # usar GeoJson para polígono da cidade
-            try:
-                folium.GeoJson(
-                    geojson,
-                    name=f"{distribuidor} - {cidade}",
-                    style_function=lambda feature, cor=cor: {
-                        "fillColor": cor,
-                        "color": "#666666",
-                        "weight": 1,
-                        "fillOpacity": 0.55
-                    },
-                    tooltip=f"{distribuidor} ({cidade} - {estado})"
-                ).add_to(mapa)
-            except Exception:
-                pass
+            folium.GeoJson(
+                geojson,
+                style_function=lambda feature, cor=cor: {
+                    "fillColor": cor,
+                    "color": "#666666",
+                    "weight": 1.2,
+                    "fillOpacity": 0.55
+                },
+                tooltip=f"{row['Distribuidor']} ({cidade} - {estado})"
+            ).add_to(mapa)
         else:
-            # fallback para Marker/CircleMarker pela lat/lon
             try:
-                lat = float(row["Latitude"]) if row["Latitude"] not in (None, "") else None
-                lon = float(row["Longitude"]) if row["Longitude"] not in (None, "") else None
-                if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
-                    # tentar geocoding leve se não tem coords
-                    lat, lon = obter_coordenadas(cidade, estado)
-                if lat and lon:
-                    folium.CircleMarker(
-                        location=[lat, lon],
-                        radius=10,
-                        color="#333333",
-                        fill=True,
-                        fill_color=cor,
-                        fill_opacity=0.7,
-                        popup=f"{distribuidor} ({cidade} - {estado})"
-                    ).add_to(mapa)
-            except Exception:
+                lat = float(row["Latitude"]) if row["Latitude"] not in (None, "") else -14.2350
+                lon = float(row["Longitude"]) if row["Longitude"] not in (None, "") else -51.9253
+                folium.CircleMarker(
+                   location=[lat, lon],
+                   radius=12,
+                   color="#333333",
+                   fill=True,
+                   fill_color=cor,
+                   fill_opacity=0.6,
+                   popup=f"{row['Distribuidor']} ({cidade} - {estado})"
+                ).add_to(mapa)
+            except:
                 continue
-
+    geo_estados = obter_geojson_estados()
+    if geo_estados:
+        folium.GeoJson(
+            geo_estados,
+            name="Divisas Estaduais",
+            style_function=lambda f: f.get("properties", {}).get("style", {
+                "color": "#000000",
+                "weight": 3,
+                "fillOpacity": 0
+            }),
+            tooltip=folium.GeoJsonTooltip(fields=["nome"], aliases=["Estado:"])
+        ).add_to(mapa)
     folium.LayerControl().add_to(mapa)
     return mapa
 
 # -----------------------------
-# USUÁRIOS / LOGIN
+# LOGIN PERSISTENTE
 # -----------------------------
+USUARIOS_FILE = "usuarios.json"
+
 def init_usuarios():
-    """Inicializa arquivo de usuários com admin padrão caso não exista"""
     try:
-        with open(USUARIOS_FILE, "r", encoding="utf-8") as f:
+        with open(USUARIOS_FILE, "r") as f:
             usuarios = json.load(f)
             if not isinstance(usuarios, dict):
                 raise ValueError("Formato inválido")
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
         senha_hash = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode()
         usuarios = {"admin": {"senha": senha_hash, "nivel": "editor"}}
-        try:
-            with open(USUARIOS_FILE, "w", encoding="utf-8") as f:
-                json.dump(usuarios, f, indent=4)
-        except Exception:
-            pass
+        with open(USUARIOS_FILE, "w") as f:
+            json.dump(usuarios, f, indent=4)
     return usuarios
 
 usuarios = init_usuarios()
@@ -359,21 +274,6 @@ logado = usuario_cookie != "" and nivel_cookie != ""
 usuario_atual = usuario_cookie if logado else None
 nivel_acesso = nivel_cookie if logado else None
 
-# -----------------------------
-# CARREGAMENTO INICIAL DE DADOS (SESSION STATE)
-# -----------------------------
-if "df" not in st.session_state:
-    st.session_state.df = carregar_dados()
-if "cidade_busca" not in st.session_state:
-    st.session_state.cidade_busca = ""
-
-# -----------------------------
-# INTERFACE / NAVIGAÇÃO
-# -----------------------------
-menu = ["Cadastro", "Lista / Editar / Excluir", "Mapa"]
-choice = st.sidebar.radio("Navegação", menu)
-
-# ---------- Tela de login ----------
 if not logado:
     st.title("🔐 Login de Acesso")
     usuario = st.text_input("Usuário")
@@ -383,18 +283,36 @@ if not logado:
             cookies["usuario"] = usuario
             cookies["nivel"] = usuarios[usuario]["nivel"]
             cookies.save()
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Usuário ou senha incorretos!")
     st.stop()
 
-# ---------- Sidebar info ----------
 st.sidebar.write(f"👤 {usuario_atual} ({nivel_acesso})")
 if st.sidebar.button("🚪 Sair"):
     cookies["usuario"] = ""
     cookies["nivel"] = ""
     cookies.save()
-    st.experimental_rerun()
+    st.rerun()
+
+# -----------------------------
+# CARREGAR DADOS (sessão)
+# -----------------------------
+if "df" not in st.session_state:
+    st.session_state.df = carregar_dados()
+if "cidade_busca" not in st.session_state:
+    st.session_state.cidade_busca = ""
+
+menu = ["Cadastro", "Lista / Editar / Excluir", "Mapa"]
+choice = st.sidebar.radio("Navegação", menu)
+
+def validar_telefone(tel):
+    padrao = r'^\(\d{2}\) \d{4,5}-\d{4}$'
+    return re.match(padrao, tel)
+
+def validar_email(email):
+    padrao = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+    return re.match(padrao, email)
 
 # =============================
 # CADASTRO
@@ -404,7 +322,7 @@ if choice == "Cadastro" and nivel_cookie == "editor":
     col1, col2 = st.columns(2)
     with col1:
         estados = carregar_estados()
-        siglas = [e["sigla"] for e in estados] if estados else []
+        siglas = [e["sigla"] for e in estados]
         estado_sel = st.selectbox("Estado", siglas)
         cidades = [c["nome"] for c in carregar_cidades(estado_sel)] if estado_sel else []
         cidades_sel = st.multiselect("Cidades", cidades)
@@ -501,20 +419,13 @@ elif choice == "Lista / Editar / Excluir":
 # =============================
 elif choice == "Mapa":
     st.subheader("🗺️ Mapa de Distribuidores")
-    distribuidores = sorted(st.session_state.df["Distribuidor"].unique())
-    distribuidores_multiselect = st.multiselect("Filtrar Distribuidores", distribuidores)
-
+    distribuidores = st.multiselect("Filtrar Distribuidores", st.session_state.df["Distribuidor"].unique())
     st.markdown("### 🔎 Buscar Cidade")
     todas_cidades = carregar_todas_cidades()
 
     col1, col2 = st.columns([4,1])
     with col1:
-        index_cidade = 0
-        if st.session_state.cidade_busca:
-            try:
-                index_cidade = todas_cidades.index(st.session_state.cidade_busca) + 1
-            except ValueError:
-                index_cidade = 0
+        index_cidade = 0 if st.session_state.cidade_busca == "" else (todas_cidades.index(st.session_state.cidade_busca) + 1 if st.session_state.cidade_busca in todas_cidades else 0)
         cidade_selecionada = st.selectbox("Digite o nome da cidade e selecione:", [""] + todas_cidades, index=index_cidade)
     with col2:
         if st.button("Limpar busca"):
@@ -525,28 +436,18 @@ elif choice == "Mapa":
         st.session_state.cidade_busca = cidade_selecionada
 
     if st.session_state.cidade_busca:
-        try:
-            cidade_nome, estado_sigla = st.session_state.cidade_busca.split(" - ")
-        except ValueError:
-            st.warning("Formato de cidade inválido.")
-            cidade_nome, estado_sigla = None, None
-
-        if cidade_nome and estado_sigla:
-            df_cidade = st.session_state.df[
-                (st.session_state.df["Cidade"].str.lower() == cidade_nome.lower()) &
-                (st.session_state.df["Estado"].str.upper() == estado_sigla.upper())
-            ]
-            if df_cidade.empty:
-                st.warning(f"❌ Nenhum distribuidor encontrado em **{cidade_nome} - {estado_sigla}**.")
-            else:
-                st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{cidade_nome} - {estado_sigla}**:")
-                st.dataframe(df_cidade[["Distribuidor","Contato","Email","Estado","Cidade"]], use_container_width=True)
-                with st.spinner("🗺️ Carregando mapa da cidade..."):
-                    mapa = criar_mapa(df_cidade)
-                st_folium(mapa, width=1200, height=700)
+        cidade_nome, estado_sigla = st.session_state.cidade_busca.split(" - ")
+        df_cidade = st.session_state.df[
+            (st.session_state.df["Cidade"].str.lower() == cidade_nome.lower()) &
+            (st.session_state.df["Estado"].str.upper() == estado_sigla.upper())
+        ]
+        if df_cidade.empty:
+            st.warning(f"❌ Nenhum distribuidor encontrado em **{cidade_nome} - {estado_sigla}**.")
         else:
-            st.warning("Cidade inválida.")
+            st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{cidade_nome} - {estado_sigla}**:")
+            st.dataframe(df_cidade[["Distribuidor","Contato","Email","Estado","Cidade"]], use_container_width=True)
+            mapa = criar_mapa(df_cidade)
+            st_folium(mapa, width=1200, height=700)
     else:
-        with st.spinner("🗺️ Carregando mapa... isso pode levar alguns segundos no primeiro acesso..."):
-            mapa = criar_mapa(st.session_state.df, filtro_distribuidores=distribuidores_multiselect if distribuidores_multiselect else None)
+        mapa = criar_mapa(st.session_state.df, filtro_distribuidores=distribuidores if distribuidores else None)
         st_folium(mapa, width=1200, height=700)

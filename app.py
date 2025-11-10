@@ -1,9 +1,8 @@
 # -------------------------------------------------------------
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
-# Corrigido: filtros na sidebar, limpar filtros sem erro,
-# multiselect de distribuidores com opções corretas,
-# zoom por estado robusto (evita "Antártida").
-# Base de dados: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
+# Corrigido: sanitização de Latitude/Longitude, zoom por estado robusto,
+# filtros combinados e botão Limpar filtros sem st.experimental_rerun().
+# Base de dados: aba "Página1" do spreadsheet configurado.
 # -------------------------------------------------------------
 import streamlit as st
 st.set_page_config(page_title="Distribuidores", layout="wide")
@@ -63,9 +62,9 @@ init_gsheets()
 # -----------------------------
 # FUNÇÕES DE DADOS (Sheets)
 # -----------------------------
-@st.cache_data(ttl=300)  # cache por 5 minutos
+@st.cache_data(ttl=300)
 def carregar_dados():
-    """Lê os dados do Google Sheets e mantém cache temporário para evitar excesso de requisições"""
+    """Busca dados do Google Sheets, garante colunas e sanitiza lat/lon."""
     try:
         records = WORKSHEET.get_all_records()
     except Exception as e:
@@ -85,7 +84,35 @@ def carregar_dados():
     for col in COLUNAS:
         if col not in df.columns:
             df[col] = ""
-    df = df[COLUNAS]
+
+    # Keep only expected columns and order
+    df = df[COLUNAS].copy()
+
+    # Sanitizar Latitude/Longitude: converter para número, aceitar apenas faixa do Brasil
+    def to_float_safe(x):
+        if x is None:
+            return pd.NA
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if s == "":
+            return pd.NA
+        # substituir vírgula por ponto
+        s = s.replace(",", ".")
+        # remover espaços
+        s = s.replace(" ", "")
+        try:
+            return float(s)
+        except:
+            return pd.NA
+
+    df["Latitude"] = df["Latitude"].apply(to_float_safe)
+    df["Longitude"] = df["Longitude"].apply(to_float_safe)
+
+    # Validar limites aproximados do Brasil (lat: -35..6, lon: -82..-30). Valores fora são considerados inválidos.
+    df.loc[~df["Latitude"].between(-35.0, 6.0, inclusive="both"), "Latitude"] = pd.NA
+    df.loc[~df["Longitude"].between(-82.0, -30.0, inclusive="both"), "Longitude"] = pd.NA
+
     return df
 
 def salvar_dados(df):
@@ -95,7 +122,7 @@ def salvar_dados(df):
         df2 = df2[COLUNAS].fillna("")
         WORKSHEET.clear()
         WORKSHEET.update([df2.columns.values.tolist()] + df2.values.tolist())
-        st.cache_data.clear()  # limpa cache para forçar recarregamento atualizado
+        st.cache_data.clear()
     except Exception as e:
         st.error("Erro ao salvar dados na planilha: " + str(e))
 
@@ -124,9 +151,8 @@ def cidade_eh_capital(cidade, uf):
     return f"{cidade}-{uf}" in CAPITAIS_BRASILEIRAS
 
 # -----------------------------
-# CENTROIDES FIXOS POR UF (fallback rápido e seguro)
+# CENTROIDES FIXOS POR UF (fallback seguro)
 # -----------------------------
-# Estas são coordenadas aproximadas do centro de cada estado brasileiro (lat, lon) e um zoom sugerido.
 STATE_CENTROIDS = {
     "AC": {"center": [-8.77, -70.55], "zoom": 6},
     "AL": {"center": [-9.62, -36.82], "zoom": 7},
@@ -235,10 +261,10 @@ def cor_distribuidor(nome):
     h += 0x111111
     return f"#{h:06X}"
 
-# utility: extrai coords de geojson (lon, lat) recursivamente
+# extrai coords recursivamente de geojson
 def _extract_coords_from_geojson_coords(coords, out):
     if isinstance(coords[0], (float, int)):
-        out.append((coords[1], coords[0]))  # (lat, lon)
+        out.append((coords[1], coords[0]))
     else:
         for c in coords:
             _extract_coords_from_geojson_coords(c, out)
@@ -270,10 +296,8 @@ def _state_feature_by_sigla(geojson_estados, sigla):
     return None
 
 def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
-    # centro padrão do Brasil
     default_location = [-14.2350, -51.9253]
     zoom_start = 5
-
     if zoom_to_state and isinstance(zoom_to_state, dict):
         center = zoom_to_state.get("center", default_location)
         zoom_start = zoom_to_state.get("zoom", 6)
@@ -309,15 +333,15 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                 pass
         else:
             try:
-                lat_raw = row.get("Latitude", "")
-                lon_raw = row.get("Longitude", "")
-                lat = float(lat_raw) if lat_raw not in (None, "", " ") else None
-                lon = float(lon_raw) if lon_raw not in (None, "", " ") else None
-                if lat is None or lon is None:
-                    # sem coords válidas -> não inserir marcador (evita centros errados)
+                lat = row.get("Latitude", pd.NA)
+                lon = row.get("Longitude", pd.NA)
+                if pd.isna(lat) or pd.isna(lon):
+                    continue
+                # final sanity check
+                if not (-35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0):
                     continue
                 folium.CircleMarker(
-                   location=[lat, lon],
+                   location=[float(lat), float(lon)],
                    radius=8,
                    color="#333333",
                    fill=True,
@@ -328,7 +352,6 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
             except:
                 continue
 
-    # adicionar contornos dos estados (se disponível)
     geo_estados = obter_geojson_estados()
     if geo_estados:
         try:
@@ -451,10 +474,23 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                 novos = []
                 for c in cidades_sel:
                     lat, lon = obter_coordenadas(c, estado_sel)
-                    novos.append([nome, contato, email, estado_sel, c, lat, lon])
+                    # sanitize obtained coords
+                    try:
+                        if lat is None or lon is None or lat == "" or lon == "":
+                            lat_v, lon_v = pd.NA, pd.NA
+                        else:
+                            lat_v = float(str(lat).replace(",", "."))
+                            lon_v = float(str(lon).replace(",", "."))
+                            if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
+                                lat_v, lon_v = pd.NA, pd.NA
+                    except:
+                        lat_v, lon_v = pd.NA, pd.NA
+                    novos.append([nome, contato, email, estado_sel, c, lat_v, lon_v])
                 novo_df = pd.DataFrame(novos, columns=COLUNAS)
                 st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
                 salvar_dados(st.session_state.df)
+                # recarregar df sanitizado em session_state
+                st.session_state.df = carregar_dados()
                 st.success(f"✅ Distribuidor '{nome}' adicionado!")
 
 # =============================
@@ -499,10 +535,21 @@ elif choice == "Lista / Editar / Excluir":
                             novos = []
                             for cidade in cidades_novas:
                                 lat, lon = obter_coordenadas(cidade, estado_edit)
-                                novos.append([nome_edit, contato_edit, email_edit, estado_edit, cidade, lat, lon])
+                                try:
+                                    if lat is None or lon is None or lat == "" or lon == "":
+                                        lat_v, lon_v = pd.NA, pd.NA
+                                    else:
+                                        lat_v = float(str(lat).replace(",", "."))
+                                        lon_v = float(str(lon).replace(",", "."))
+                                        if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
+                                            lat_v, lon_v = pd.NA, pd.NA
+                                except:
+                                    lat_v, lon_v = pd.NA, pd.NA
+                                novos.append([nome_edit, contato_edit, email_edit, estado_edit, cidade, lat_v, lon_v])
                             novo_df = pd.DataFrame(novos, columns=COLUNAS)
                             st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
                             salvar_dados(st.session_state.df)
+                            st.session_state.df = carregar_dados()
                             st.success("✅ Alterações salvas!")
 
         with st.expander("🗑️ Excluir"):
@@ -511,6 +558,7 @@ elif choice == "Lista / Editar / Excluir":
                 if st.button("Excluir Distribuidor"):
                     st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_del]
                     salvar_dados(st.session_state.df)
+                    st.session_state.df = carregar_dados()
                     st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
@@ -519,9 +567,7 @@ elif choice == "Lista / Editar / Excluir":
 elif choice == "Mapa":
     st.subheader("🗺️ Mapa de Distribuidores")
 
-    # ---------------------
-    # SIDEBAR: filtros combinados
-    # ---------------------
+    # Sidebar filtros combinados
     st.sidebar.markdown("### 🔎 Filtros do Mapa")
 
     # garantir chaves de session_state
@@ -538,16 +584,15 @@ elif choice == "Mapa":
     estado_filtro = st.sidebar.selectbox("Filtrar por Estado", [""] + siglas, index=(0 if st.session_state.estado_filtro == "" else ([""] + siglas).index(st.session_state.estado_filtro)))
     st.session_state.estado_filtro = estado_filtro
 
-    # Filtrar distribuidores (multiselect) - opções restritas ao estado se houver,
-    # senão mostrar todos os distribuidores
+    # Opções do multiselect Filtrar Distribuidores
     if estado_filtro:
         distribuidores_opcoes = st.session_state.df.loc[st.session_state.df["Estado"] == estado_filtro, "Distribuidor"].dropna().unique().tolist()
     else:
         distribuidores_opcoes = st.session_state.df["Distribuidor"].dropna().unique().tolist()
-
     distribuidores_opcoes = sorted(distribuidores_opcoes)
+
     distribuidores_selecionados = st.sidebar.multiselect("Filtrar Distribuidores (opcional)", distribuidores_opcoes, default=st.session_state.distribuidores_selecionados)
-    # garante que session_state mantenha apenas valores válidos
+    # manter apenas selecionados válidos
     st.session_state.distribuidores_selecionados = [d for d in distribuidores_selecionados if d in distribuidores_opcoes]
 
     # Busca por cidade (lista filtrada por estado se houver)
@@ -559,16 +604,13 @@ elif choice == "Mapa":
     if cidade_selecionada_sidebar:
         st.session_state.cidade_busca = cidade_selecionada_sidebar
 
-    # Botão limpar filtros: reseta variáveis de session_state (sem usar experimental_rerun)
+    # Botão limpar filtros: reseta session_state (sem rerun)
     if st.sidebar.button("Limpar filtros"):
         st.session_state.estado_filtro = ""
         st.session_state.distribuidores_selecionados = []
         st.session_state.cidade_busca = ""
-        # não usamos st.experimental_rerun() — o Streamlit já reflete o novo session_state na UI sem necessidade de rerun aqui.
 
-    # ---------------------
-    # Aplicar filtros combinados ao dataframe
-    # ---------------------
+    # Aplicar filtros combinados
     df_filtro = st.session_state.df.copy()
 
     if st.session_state.estado_filtro:
@@ -585,20 +627,18 @@ elif choice == "Mapa":
                 (df_filtro["Estado"].str.upper() == estado_sigla.upper())
             ]
         except Exception:
-            # formato inesperado: ignorar filtro de cidade
             pass
 
-    # ---------------------
-    # Determinar zoom/centro de forma robusta (evitar Antártida)
-    # - 1) usar as coords dos distribuidores filtrados (se houver)
-    # - 2) senão, usar centroid fixo em STATE_CENTROIDS (por sigla)
-    # - 3) fallback: centro do Brasil
-    # ---------------------
+    # Determinar zoom/centro de forma robusta
     zoom_to_state = None
     if st.session_state.estado_filtro:
+        # 1) usar coords válidas dos distribuidores do estado
         df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
         lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
         lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
+        # filtrar por faixa do Brasil (proteção extra)
+        lats = lats[(lats >= -35.0) & (lats <= 6.0)]
+        lons = lons[(lons >= -82.0) & (lons <= -30.0)]
         if not lats.empty and not lons.empty:
             center_lat = float(lats.mean())
             center_lon = float(lons.mean())
@@ -615,18 +655,20 @@ elif choice == "Mapa":
                 zoom = 6
             zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
         else:
-            # fallback seguro: usar centroides pré-definidos por UF
+            # 2) fallback para centroides fixos por UF
             if st.session_state.estado_filtro in STATE_CENTROIDS:
                 zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
             else:
                 zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
 
-    # ---------------------
-    # Criar e exibir o mapa com filtros aplicados
-    # ---------------------
+    # Criar e exibir mapa
     mapa = criar_mapa(
         df_filtro,
         filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None),
         zoom_to_state=zoom_to_state
     )
+
+    # (opcional) debug rápido no topo do mapa — descomente se quiser inspecionar:
+    # st.sidebar.write("DEBUG:", {"estado_filtro": st.session_state.estado_filtro, "len_df_filtro": len(df_filtro)})
+
     st_folium(mapa, width=1200, height=700)

@@ -1,8 +1,8 @@
 # -------------------------------------------------------------
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
-# Corrigido: sanitização de Latitude/Longitude, zoom por estado robusto,
-# filtros combinados e botão Limpar filtros sem st.experimental_rerun().
-# Base de dados: aba "Página1" do spreadsheet configurado.
+# Versão final: filtros sidebar, busca cidade com mensagem/tabela,
+# limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
+# Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
 # -------------------------------------------------------------
 import streamlit as st
 st.set_page_config(page_title="Distribuidores", layout="wide")
@@ -85,7 +85,6 @@ def carregar_dados():
         if col not in df.columns:
             df[col] = ""
 
-    # Keep only expected columns and order
     df = df[COLUNAS].copy()
 
     # Sanitizar Latitude/Longitude: converter para número, aceitar apenas faixa do Brasil
@@ -97,9 +96,7 @@ def carregar_dados():
         s = str(x).strip()
         if s == "":
             return pd.NA
-        # substituir vírgula por ponto
         s = s.replace(",", ".")
-        # remover espaços
         s = s.replace(" ", "")
         try:
             return float(s)
@@ -337,7 +334,6 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                 lon = row.get("Longitude", pd.NA)
                 if pd.isna(lat) or pd.isna(lon):
                     continue
-                # final sanity check
                 if not (-35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0):
                     continue
                 folium.CircleMarker(
@@ -474,7 +470,6 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                 novos = []
                 for c in cidades_sel:
                     lat, lon = obter_coordenadas(c, estado_sel)
-                    # sanitize obtained coords
                     try:
                         if lat is None or lon is None or lat == "" or lon == "":
                             lat_v, lon_v = pd.NA, pd.NA
@@ -489,7 +484,6 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                 novo_df = pd.DataFrame(novos, columns=COLUNAS)
                 st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
                 salvar_dados(st.session_state.df)
-                # recarregar df sanitizado em session_state
                 st.session_state.df = carregar_dados()
                 st.success(f"✅ Distribuidor '{nome}' adicionado!")
 
@@ -562,7 +556,7 @@ elif choice == "Lista / Editar / Excluir":
                     st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
-# MAPA (filtros na sidebar, sem tabela na área principal)
+# MAPA (filtros na sidebar, com busca de cidade mostrando mensagens/tabela)
 # =============================
 elif choice == "Mapa":
     st.subheader("🗺️ Mapa de Distribuidores")
@@ -592,7 +586,6 @@ elif choice == "Mapa":
     distribuidores_opcoes = sorted(distribuidores_opcoes)
 
     distribuidores_selecionados = st.sidebar.multiselect("Filtrar Distribuidores (opcional)", distribuidores_opcoes, default=st.session_state.distribuidores_selecionados)
-    # manter apenas selecionados válidos
     st.session_state.distribuidores_selecionados = [d for d in distribuidores_selecionados if d in distribuidores_opcoes]
 
     # Busca por cidade (lista filtrada por estado se houver)
@@ -619,56 +612,125 @@ elif choice == "Mapa":
     if st.session_state.distribuidores_selecionados:
         df_filtro = df_filtro[df_filtro["Distribuidor"].isin(st.session_state.distribuidores_selecionados)]
 
+    # Se houve busca de cidade (prioridade de exibição de mensagem/tabela)
     if st.session_state.cidade_busca:
         try:
             cidade_nome, estado_sigla = st.session_state.cidade_busca.split(" - ")
-            df_filtro = df_filtro[
-                (df_filtro["Cidade"].str.lower() == cidade_nome.lower()) &
-                (df_filtro["Estado"].str.upper() == estado_sigla.upper())
+            df_cidade = st.session_state.df[
+                (st.session_state.df["Cidade"].str.lower() == cidade_nome.lower()) &
+                (st.session_state.df["Estado"].str.upper() == estado_sigla.upper())
             ]
         except Exception:
-            pass
+            df_cidade = pd.DataFrame(columns=COLUNAS)
 
-    # Determinar zoom/centro de forma robusta
-    zoom_to_state = None
-    if st.session_state.estado_filtro:
-        # 1) usar coords válidas dos distribuidores do estado
-        df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
-        lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
-        lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
-        # filtrar por faixa do Brasil (proteção extra)
-        lats = lats[(lats >= -35.0) & (lats <= 6.0)]
-        lons = lons[(lons >= -82.0) & (lons <= -30.0)]
-        if not lats.empty and not lons.empty:
-            center_lat = float(lats.mean())
-            center_lon = float(lons.mean())
-            lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
-            lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
-            span = max(lat_span, lon_span)
-            if span < 0.2:
-                zoom = 11
-            elif span < 1.0:
-                zoom = 9
-            elif span < 3.0:
-                zoom = 8
-            else:
-                zoom = 6
-            zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
-        else:
-            # 2) fallback para centroides fixos por UF
-            if st.session_state.estado_filtro in STATE_CENTROIDS:
-                zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
+        # Mensagem e tabela conforme comportamento desejado
+        if df_cidade.empty:
+            st.warning(f"❌ Nenhum distribuidor encontrado em **{st.session_state.cidade_busca}**.")
+            # Mesmo quando não há distribuidores, mostra mapa centrado no estado (se escolhido) ou no BR
+            # Determinar zoom_to_state (mesma lógica abaixo)
+            zoom_to_state = None
+            if st.session_state.estado_filtro:
+                df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
+                lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
+                lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
+                lats = lats[(lats >= -35.0) & (lats <= 6.0)]
+                lons = lons[(lons >= -82.0) & (lons <= -30.0)]
+                if not lats.empty and not lons.empty:
+                    center_lat = float(lats.mean())
+                    center_lon = float(lons.mean())
+                    lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
+                    lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
+                    span = max(lat_span, lon_span)
+                    if span < 0.2:
+                        zoom = 11
+                    elif span < 1.0:
+                        zoom = 9
+                    elif span < 3.0:
+                        zoom = 8
+                    else:
+                        zoom = 6
+                    zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
+                else:
+                    if st.session_state.estado_filtro in STATE_CENTROIDS:
+                        zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
+                    else:
+                        zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
             else:
                 zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
 
-    # Criar e exibir mapa
-    mapa = criar_mapa(
-        df_filtro,
-        filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None),
-        zoom_to_state=zoom_to_state
-    )
+            mapa = criar_mapa(pd.DataFrame(columns=COLUNAS), filtro_distribuidores=None, zoom_to_state=zoom_to_state)
+            st_folium(mapa, width=1200, height=700)
+        else:
+            st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{st.session_state.cidade_busca}**:")
+            # Mostrar tabela com Distribuidor, Contato, Email
+            st.dataframe(df_cidade[["Distribuidor", "Contato", "Email"]].reset_index(drop=True), use_container_width=True)
 
-    # (opcional) debug rápido no topo do mapa — descomente se quiser inspecionar:
-    # st.sidebar.write("DEBUG:", {"estado_filtro": st.session_state.estado_filtro, "len_df_filtro": len(df_filtro)})
+            # Criar mapa apenas com df_cidade (aplica filtro de distribuidores caso tenham sido selecionados)
+            df_cidade_map = df_cidade.copy()
+            if st.session_state.distribuidores_selecionados:
+                df_cidade_map = df_cidade_map[df_cidade_map["Distribuidor"].isin(st.session_state.distribuidores_selecionados)]
 
-    st_folium(mapa, width=1200, height=700)
+            # calcular zoom centrado em df_cidade_map (se tem coords válidas)
+            zoom_to_state = None
+            lats = pd.to_numeric(df_cidade_map["Latitude"], errors="coerce").dropna()
+            lons = pd.to_numeric(df_cidade_map["Longitude"], errors="coerce").dropna()
+            lats = lats[(lats >= -35.0) & (lats <= 6.0)]
+            lons = lons[(lons >= -82.0) & (lons <= -30.0)]
+            if not lats.empty and not lons.empty:
+                center_lat = float(lats.mean())
+                center_lon = float(lons.mean())
+                lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.02
+                lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.02
+                span = max(lat_span, lon_span)
+                if span < 0.02:
+                    zoom = 13
+                elif span < 0.2:
+                    zoom = 11
+                elif span < 1.0:
+                    zoom = 9
+                else:
+                    zoom = 8
+                zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
+            else:
+                # fallback para estado ou centro do Brasil
+                if st.session_state.estado_filtro and st.session_state.estado_filtro in STATE_CENTROIDS:
+                    zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
+                else:
+                    zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+
+            mapa = criar_mapa(df_cidade_map, filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
+            st_folium(mapa, width=1200, height=700)
+    else:
+        # Sem busca por cidade: aplicar filtros combinados e mostrar mapa geral
+        # df_filtro já aplicado por estado e por distribuidores selecionados acima
+        # Determinar zoom/centro de forma robusta (evitar Antártida)
+        zoom_to_state = None
+        if st.session_state.estado_filtro:
+            df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
+            lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
+            lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
+            lats = lats[(lats >= -35.0) & (lats <= 6.0)]
+            lons = lons[(lons >= -82.0) & (lons <= -30.0)]
+            if not lats.empty and not lons.empty:
+                center_lat = float(lats.mean())
+                center_lon = float(lons.mean())
+                lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
+                lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
+                span = max(lat_span, lon_span)
+                if span < 0.2:
+                    zoom = 11
+                elif span < 1.0:
+                    zoom = 9
+                elif span < 3.0:
+                    zoom = 8
+                else:
+                    zoom = 6
+                zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
+            else:
+                if st.session_state.estado_filtro in STATE_CENTROIDS:
+                    zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
+                else:
+                    zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+
+        mapa = criar_mapa(df_filtro, filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
+        st_folium(mapa, width=1200, height=700)

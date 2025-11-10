@@ -59,6 +59,7 @@ init_gsheets()
 # -----------------------------
 # FUNÇÕES DE DADOS (Sheets)
 # -----------------------------
+
 @st.cache_data(ttl=300)  # cache por 5 minutos
 def carregar_dados():
     """Lê os dados do Google Sheets e mantém cache temporário para evitar excesso de requisições"""
@@ -83,6 +84,7 @@ def carregar_dados():
             df[col] = ""
     df = df[COLUNAS]
     return df
+
 
 def salvar_dados(df):
     """Grava os dados no Google Sheets (sem cache)"""
@@ -197,25 +199,14 @@ def cor_distribuidor(nome):
     h += 0x111111
     return f"#{h:06X}"
 
-def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
-    # centro padrão do Brasil
-    default_location = [-14.2350, -51.9253]
-    zoom_start = 5
-
-    # Se pediu zoom para um estado (lat, lon, zoom)
-    if zoom_to_state and isinstance(zoom_to_state, dict):
-        center = zoom_to_state.get("center", default_location)
-        zoom_start = zoom_to_state.get("zoom", 6)
-        mapa = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron")
-    else:
-        mapa = folium.Map(location=default_location, zoom_start=zoom_start, tiles="CartoDB positron")
-
+def criar_mapa(df, filtro_distribuidores=None):
+    mapa = folium.Map(location=[-14.2350, -51.9253], zoom_start=5, tiles="CartoDB positron")
     for _, row in df.iterrows():
         if filtro_distribuidores and row["Distribuidor"] not in filtro_distribuidores:
             continue
         cidade = row["Cidade"]
         estado = row["Estado"]
-        geojson = obter_geojson_cidade(cidade, estado) if cidade and estado else None
+        geojson = obter_geojson_cidade(cidade, estado)
         cor = cor_distribuidor(row["Distribuidor"])
         if geojson and "features" in geojson:
             folium.GeoJson(
@@ -230,10 +221,8 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
             ).add_to(mapa)
         else:
             try:
-                lat = float(row["Latitude"]) if row["Latitude"] not in (None, "", " ") else None
-                lon = float(row["Longitude"]) if row["Longitude"] not in (None, "", " ") else None
-                if lat is None or lon is None:
-                    continue
+                lat = float(row["Latitude"]) if row["Latitude"] not in (None, "") else -14.2350
+                lon = float(row["Longitude"]) if row["Longitude"] not in (None, "") else -51.9253
                 folium.CircleMarker(
                    location=[lat, lon],
                    radius=12,
@@ -245,7 +234,6 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                 ).add_to(mapa)
             except:
                 continue
-
     geo_estados = obter_geojson_estados()
     if geo_estados:
         folium.GeoJson(
@@ -427,82 +415,39 @@ elif choice == "Lista / Editar / Excluir":
                     st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
-# MAPA (Agora com filtros na SIDEBAR)
+# MAPA COM AUTOCOMPLETE E LIMPAR BUSCA
 # =============================
 elif choice == "Mapa":
     st.subheader("🗺️ Mapa de Distribuidores")
-
-    # --- Sidebar filters (agora todos na sidebar, combinados) ---
-    st.sidebar.markdown("### 🔎 Filtros do Mapa")
-    # Estado - adiciona opção "" para nenhum filtro
-    estados = carregar_estados()
-    siglas = [e["sigla"] for e in estados]
-    estado_filtro = st.sidebar.selectbox("Filtrar por Estado", [""] + siglas, index=0)
-
-    # Filtrar distribuidores (multiselect) - restringe opções pelo estado se houver filtro de estado
-    distribuidores_opcoes = st.session_state.df["Distribuidor"].unique().tolist()
-    if estado_filtro:
-        distribuidores_opcoes = st.session_state.df[st.session_state.df["Estado"] == estado_filtro]["Distribuidor"].unique().tolist()
-    distribuidores_selecionados = st.sidebar.multiselect("Filtrar Distribuidores", sorted(distribuidores_opcoes))
-
-    # Busca por cidade (autocomplete-like) - lista completa ou filtrada por estado
+    distribuidores = st.multiselect("Filtrar Distribuidores", st.session_state.df["Distribuidor"].unique())
+    st.markdown("### 🔎 Buscar Cidade")
     todas_cidades = carregar_todas_cidades()
-    if estado_filtro:
-        # limitar lista de cidades apenas ao estado selecionado
-        todas_cidades = [c for c in todas_cidades if c.endswith(f" - {estado_filtro}")]
-    cidade_index = 0 if st.session_state.cidade_busca == "" else (todas_cidades.index(st.session_state.cidade_busca) + 1 if st.session_state.cidade_busca in todas_cidades else 0)
-    cidade_selecionada_sidebar = st.sidebar.selectbox("Buscar Cidade", [""] + todas_cidades, index=cidade_index)
 
-    if st.sidebar.button("Limpar filtros"):
-        st.session_state.cidade_busca = ""
-        # limpa distribuidores selecionados e estado
-        # (não recarregamos secrets ou usuários)
-        st.experimental_rerun()
+    col1, col2 = st.columns([4,1])
+    with col1:
+        index_cidade = 0 if st.session_state.cidade_busca == "" else (todas_cidades.index(st.session_state.cidade_busca) + 1 if st.session_state.cidade_busca in todas_cidades else 0)
+        cidade_selecionada = st.selectbox("Digite o nome da cidade e selecione:", [""] + todas_cidades, index=index_cidade)
+    with col2:
+        if st.button("Limpar busca"):
+            st.session_state.cidade_busca = ""
+            cidade_selecionada = ""
 
-    # Atualiza cidade de busca no session_state se selecionou
-    if cidade_selecionada_sidebar:
-        st.session_state.cidade_busca = cidade_selecionada_sidebar
+    if cidade_selecionada:
+        st.session_state.cidade_busca = cidade_selecionada
 
-    # Agora aplicamos os filtros combinados ao dataframe exibido e ao mapa
-    df_filtro = st.session_state.df.copy()
-
-    # Filtra por estado, se escolhido
-    if estado_filtro:
-        df_filtro = df_filtro[df_filtro["Estado"] == estado_filtro]
-
-    # Filtra por distribuidores, se escolhidos
-    if distribuidores_selecionados:
-        df_filtro = df_filtro[df_filtro["Distribuidor"].isin(distribuidores_selecionados)]
-
-    # Filtra por cidade buscada (formato "Cidade - UF")
     if st.session_state.cidade_busca:
         cidade_nome, estado_sigla = st.session_state.cidade_busca.split(" - ")
-        df_filtro = df_filtro[
-            (df_filtro["Cidade"].str.lower() == cidade_nome.lower()) &
-            (df_filtro["Estado"].str.upper() == estado_sigla.upper())
+        df_cidade = st.session_state.df[
+            (st.session_state.df["Cidade"].str.lower() == cidade_nome.lower()) &
+            (st.session_state.df["Estado"].str.upper() == estado_sigla.upper())
         ]
-
-    # Exibição tabela reduzida
-    st.dataframe(df_filtro[["Distribuidor","Contato","Email","Estado","Cidade"]], use_container_width=True)
-
-    # Determinar zoom automático ao filtrar por estado (se houver coordenadas válidas)
-    zoom_to_state = None
-    if estado_filtro:
-        # Tenta calcular centro a partir das coordenadas dos distribuidores daquele estado
-        df_state = st.session_state.df[st.session_state.df["Estado"] == estado_filtro]
-        try:
-            lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
-            lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
-            if not lats.empty and not lons.empty:
-                center_lat = float(lats.mean())
-                center_lon = float(lons.mean())
-                zoom_to_state = {"center": [center_lat, center_lon], "zoom": 6}
-            else:
-                # fallback: usar um centro aproximado por IBGE (não disponível aqui) -> mantemos centro padrão
-                zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
-        except Exception:
-            zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
-
-    # Criar e mostrar mapa com os filtros aplicados
-    mapa = criar_mapa(df_filtro, filtro_distribuidores=(distribuidores_selecionados if distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
-    st_folium(mapa, width=1200, height=700)
+        if df_cidade.empty:
+            st.warning(f"❌ Nenhum distribuidor encontrado em **{cidade_nome} - {estado_sigla}**.")
+        else:
+            st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{cidade_nome} - {estado_sigla}**:")
+            st.dataframe(df_cidade[["Distribuidor","Contato","Email","Estado","Cidade"]], use_container_width=True)
+            mapa = criar_mapa(df_cidade)
+            st_folium(mapa, width=1200, height=700)
+    else:
+        mapa = criar_mapa(st.session_state.df, filtro_distribuidores=distribuidores if distribuidores else None)
+        st_folium(mapa, width=1200, height=700)

@@ -41,7 +41,6 @@ WORKSHEET = None
 # -----------------------------
 # Inicializar Google Sheets client
 # -----------------------------
-
 def init_gsheets():
     global GC, WORKSHEET
     if "gcp_service_account" not in st.secrets:
@@ -85,10 +84,10 @@ def carregar_dados():
         return df
 
     df = pd.DataFrame(records)
+    # garantir colunas na ordem esperada
     for col in COLUNAS:
         if col not in df.columns:
             df[col] = ""
-
     df = df[COLUNAS].copy()
 
     # Sanitizar Latitude/Longitude: converter para número, aceitar apenas faixa do Brasil
@@ -252,11 +251,13 @@ def obter_geojson_cidade(cidade, estado_sigla):
 # -----------------------------
 # Utilidades
 # -----------------------------
-
 def cor_distribuidor(nome):
+    # Retorna uma lista [r,g,b] determinística por nome
     h = abs(hash(nome)) % 0xAAAAAA
     h += 0x111111
-    return f"#{h:06X}"
+    hexcol = f"{h:06X}"
+    rgb = [int(hexcol[i:i+2], 16) for i in (0, 2, 4)]
+    return rgb
 
 # -----------------------------
 # LOGIN PERSISTENTE
@@ -311,6 +312,10 @@ if "df" not in st.session_state:
     st.session_state.df = carregar_dados()
 if "cidade_busca" not in st.session_state:
     st.session_state.cidade_busca = ""
+if "estado_filtro" not in st.session_state:
+    st.session_state.estado_filtro = ""
+if "distribuidores_selecionados" not in st.session_state:
+    st.session_state.distribuidores_selecionados = []
 
 menu = ["Cadastro", "Lista / Editar / Excluir", "Mapa"]
 choice = st.sidebar.radio("Navegação", menu)
@@ -450,7 +455,7 @@ elif choice == "Lista / Editar / Excluir":
                     st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
-# MAPA (com pydeck otimizado)
+# MAPA (com pydeck otimizado e correções)
 # =============================
 elif choice == "Mapa":
     st.subheader("🗺️ Mapa de Distribuidores")
@@ -458,29 +463,23 @@ elif choice == "Mapa":
     # Sidebar filtros combinados
     st.sidebar.markdown("### 🔎 Filtros do Mapa")
 
-    # garantir chaves de session_state
-    if "estado_filtro" not in st.session_state:
-        st.session_state.estado_filtro = ""
-    if "cidade_busca" not in st.session_state:
-        st.session_state.cidade_busca = ""
-    if "distribuidores_selecionados" not in st.session_state:
-        st.session_state.distribuidores_selecionados = []
-
     # Estado (com opção vazia)
     estados = carregar_estados()
     siglas = [e["sigla"] for e in estados]
     estado_filtro = st.sidebar.selectbox("Filtrar por Estado", [""] + siglas, index=(0 if st.session_state.estado_filtro == "" else ( [""] + siglas ).index(st.session_state.estado_filtro)))
     st.session_state.estado_filtro = estado_filtro
 
-    # Opções do multiselect Filtrar Distribuidores
+    # Opções do multiselect Filtrar Distribuidores (baseado no DF atual)
     if estado_filtro:
         distribuidores_opcoes = st.session_state.df.loc[st.session_state.df["Estado"] == estado_filtro, "Distribuidor"].dropna().unique().tolist()
     else:
         distribuidores_opcoes = st.session_state.df["Distribuidor"].dropna().unique().tolist()
     distribuidores_opcoes = sorted(distribuidores_opcoes)
 
-    distribuidores_selecionados = st.sidebar.multiselect("Filtrar Distribuidores (opcional)", distribuidores_opcoes, default=st.session_state.distribuidores_selecionados)
-    st.session_state.distribuidores_selecionados = [d for d in distribuidores_selecionados if d in distribuidores_opcoes]
+    # garantir que valores default do multiselect sejam válidos
+    default_sel = [d for d in st.session_state.distribuidores_selecionados if d in distribuidores_opcoes]
+    distribuidores_selecionados = st.sidebar.multiselect("Filtrar Distribuidores (opcional)", distribuidores_opcoes, default=default_sel)
+    st.session_state.distribuidores_selecionados = distribuidores_selecionados
 
     # Busca por cidade (lista filtrada por estado se houver)
     todas_cidades = carregar_todas_cidades()
@@ -497,7 +496,7 @@ elif choice == "Mapa":
         st.session_state.distribuidores_selecionados = []
         st.session_state.cidade_busca = ""
 
-    # Opção: desenhar polígonos (pode ser lento) - default desligado para performance
+    # Option to draw polygons (disabled by default for performance)
     desenhar_poligonos = st.sidebar.checkbox("Desenhar polígonos (pode ser lento)", value=False)
 
     # Aplicar filtros combinados
@@ -507,7 +506,7 @@ elif choice == "Mapa":
     if st.session_state.distribuidores_selecionados:
         df_filtro = df_filtro[df_filtro["Distribuidor"].isin(st.session_state.distribuidores_selecionados)]
 
-    # Token Mapbox (opcional) - se disponível em secrets, configura para pydeck
+    # Mapbox token (opcional)
     if "MAPBOX_API_KEY" in st.secrets:
         pdk.settings.mapbox_api_key = st.secrets["MAPBOX_API_KEY"]
 
@@ -537,6 +536,53 @@ elif choice == "Mapa":
         else:
             return None
 
+    # Preparar função que monta e exibe o pydeck com um DataFrame de pontos
+    def mostrar_pydeck(df_points, center_zoom=None, draw_polygons=False):
+        layers = []
+        if draw_polygons:
+            # adicionar limites estaduais (leve)
+            geo_estados = obter_geojson_estados()
+            if geo_estados:
+                layers.append(pdk.Layer("GeoJsonLayer", data=geo_estados, pickable=False, stroked=True, filled=False, get_line_color=[0,0,0], get_line_width=1))
+        if not df_points.empty:
+            # garantir colunas numericas e criar colunas auxiliares
+            df = df_points.copy()
+            df["Latitude"] = pd.to_numeric(df["Latitude"], errors="coerce")
+            df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
+            df = df.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
+            if df.empty:
+                # exibir mapa vazio
+                if center_zoom is None:
+                    center_zoom = {"center": [-14.2350, -51.9253], "zoom": 5}
+                view = pdk.ViewState(latitude=center_zoom["center"][0], longitude=center_zoom["center"][1], zoom=center_zoom["zoom"], pitch=0)
+                deck = pdk.Deck(layers=[], initial_view_state=view)
+                st.pydeck_chart(deck, use_container_width=True)
+                return
+            # coordenadas e cor
+            df["coordinates"] = df.apply(lambda r: [float(r["Longitude"]), float(r["Latitude"])] , axis=1)
+            df["color"] = df["Distribuidor"].apply(lambda n: cor_distribuidor(n))
+
+            scatter = pdk.Layer(
+                "ScatterplotLayer",
+                data=df,
+                get_position="coordinates",
+                get_fill_color="color",
+                get_radius=200,
+                radius_scale=1,
+                pickable=True,
+                auto_highlight=True,
+            )
+            layers.append(scatter)
+
+        # calcular view
+        if center_zoom is None:
+            center_zoom = calcular_zoom_e_centro(df_points) or {"center": [-14.2350, -51.9253], "zoom": 5}
+        view = pdk.ViewState(latitude=center_zoom["center"][0], longitude=center_zoom["center"][1], zoom=center_zoom["zoom"], pitch=0)
+
+        tooltip = {"html": "<b>{Distribuidor}</b><br/>{Cidade} - {Estado}<br/>{Contato}", "style": {"color": "#000"}}
+        deck = pdk.Deck(layers=layers, initial_view_state=view, tooltip=tooltip)
+        st.pydeck_chart(deck, use_container_width=True)
+
     # Se houve busca de cidade (prioridade de exibição de mensagem/tabela)
     if st.session_state.cidade_busca:
         try:
@@ -559,118 +605,36 @@ elif choice == "Mapa":
                     zoom_to_state = STATE_CENTROIDS.get(st.session_state.estado_filtro, {"center": [-14.2350, -51.9253], "zoom": 5})
             else:
                 zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
-
-            # montar pydeck vazio
-            view = pdk.ViewState(latitude=zoom_to_state["center"][0], longitude=zoom_to_state["center"][1], zoom=zoom_to_state["zoom"], pitch=0)
-            deck = pdk.Deck(initial_view_state=view, layers=[])
-            st.pydeck_chart(deck, use_container_width=True)
+            mostrar_pydeck(pd.DataFrame(columns=COLUNAS), center_zoom=zoom_to_state, draw_polygons=desenhar_poligonos)
         else:
             st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{st.session_state.cidade_busca}**:")
             st.dataframe(df_cidade[["Distribuidor", "Contato", "Email"]].reset_index(drop=True), use_container_width=True)
 
-            # filtrar distribuidores selecionados se houver
+            # aplicar filtro adicional por distribuidores selecionados
             df_cidade_map = df_cidade.copy()
             if st.session_state.distribuidores_selecionados:
                 df_cidade_map = df_cidade_map[df_cidade_map["Distribuidor"].isin(st.session_state.distribuidores_selecionados)]
 
-            # preparar dados para pydeck: remover linhas sem coords válidas
-            df_pts = df_cidade_map.copy()
-            df_pts["Latitude"] = pd.to_numeric(df_pts["Latitude"], errors="coerce")
-            df_pts["Longitude"] = pd.to_numeric(df_pts["Longitude"], errors="coerce")
-            df_pts = df_pts.dropna(subset=["Latitude", "Longitude"])
-
-            zoom_to_state = calcular_zoom_e_centro(df_pts)
-            if not zoom_to_state:
+            # calcular centro/zoom e mostrar pydeck
+            center_zoom = calcular_zoom_e_centro(df_cidade_map)
+            if not center_zoom:
                 if st.session_state.estado_filtro and st.session_state.estado_filtro in STATE_CENTROIDS:
-                    zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
+                    center_zoom = STATE_CENTROIDS[st.session_state.estado_filtro]
                 else:
-                    zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
-
-            # Criar camadas pydeck
-            layers = []
-
-            if desenhar_poligonos:
-                # tentar buscar geojson da cidade (apenas uma vez por cidade)
-                geo = obter_geojson_cidade(cidade_nome, estado_sigla)
-                if geo:
-                    layers.append(pdk.Layer("GeoJsonLayer", data=geo, pickable=False, stroked=True, filled=True, get_fill_color="[100,100,200,60]", get_line_color="[0,0,0]") )
-
-            if not df_pts.empty:
-                df_pts = df_pts.rename(columns={"Longitude": "lon", "Latitude": "lat"})
-                # cor por distribuidor através de código hex -> rgb
-                def hex_to_rgb(hexcol):
-                    hexcol = hexcol.lstrip('#')
-                    return [int(hexcol[i:i+2], 16) for i in (0, 2, 4)]
-                df_pts["color_rgb"] = df_pts["Distribuidor"].apply(lambda n: hex_to_rgb(cor_distribuidor(n)))
-
-                scatter = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=df_pts,
-                    get_position=["lon", "lat"],
-                    get_fill_color="color_rgb",
-                    get_radius=500,
-                    radius_scale=1,
-                    pickable=True,
-                    auto_highlight=True,
-                )
-                layers.append(scatter)
-
-            # incluir limites estaduais (leve) - cacheado
-            if desenhar_poligonos:
-                geo_estados = obter_geojson_estados()
-                if geo_estados:
-                    layers.append(pdk.Layer("GeoJsonLayer", data=geo_estados, pickable=False, stroked=True, filled=False, get_line_color=[0,0,0], get_line_width=1))
-
-            view = pdk.ViewState(latitude=zoom_to_state["center"][0], longitude=zoom_to_state["center"][1], zoom=zoom_to_state["zoom"], pitch=0)
-            deck = pdk.Deck(layers=layers, initial_view_state=view, tooltip={"html": "<b>{Distribuidor}</b><br/>{Cidade} - {Estado}<br/>{Contato}", "style": {"color": "#000"}})
-            st.pydeck_chart(deck, use_container_width=True)
+                    center_zoom = {"center": [-14.2350, -51.9253], "zoom": 5}
+            mostrar_pydeck(df_cidade_map, center_zoom=center_zoom, draw_polygons=desenhar_poligonos)
 
     else:
         # Sem busca por cidade: aplicar filtros combinados e mostrar mapa geral
         df_filtro = df_filtro.copy()
-        # preparar pontos
-        df_pts = df_filtro.copy()
-        df_pts["Latitude"] = pd.to_numeric(df_pts["Latitude"], errors="coerce")
-        df_pts["Longitude"] = pd.to_numeric(df_pts["Longitude"], errors="coerce")
-        df_pts = df_pts.dropna(subset=["Latitude", "Longitude"])            
-
-        zoom_to_state = calcular_zoom_e_centro(df_filtro)
-        if not zoom_to_state:
+        center_zoom = calcular_zoom_e_centro(df_filtro)
+        if not center_zoom:
             if st.session_state.estado_filtro and st.session_state.estado_filtro in STATE_CENTROIDS:
-                zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
+                center_zoom = STATE_CENTROIDS[st.session_state.estado_filtro]
             else:
-                zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
-
-        layers = []
-        if desenhar_poligonos:
-            geo_estados = obter_geojson_estados()
-            if geo_estados:
-                layers.append(pdk.Layer("GeoJsonLayer", data=geo_estados, pickable=False, stroked=True, filled=False, get_line_color=[0,0,0], get_line_width=1))
-
-        if not df_pts.empty:
-            df_pts = df_pts.rename(columns={"Longitude": "lon", "Latitude": "lat"})
-            def hex_to_rgb(hexcol):
-                hexcol = hexcol.lstrip('#')
-                return [int(hexcol[i:i+2], 16) for i in (0, 2, 4)]
-            df_pts["color_rgb"] = df_pts["Distribuidor"].apply(lambda n: hex_to_rgb(cor_distribuidor(n)))
-
-            scatter = pdk.Layer(
-                "ScatterplotLayer",
-                data=df_pts,
-                get_position=["lon", "lat"],
-                get_fill_color="color_rgb",
-                get_radius=500,
-                radius_scale=1,
-                pickable=True,
-                auto_highlight=True,
-            )
-            layers.append(scatter)
-
-        view = pdk.ViewState(latitude=zoom_to_state["center"][0], longitude=zoom_to_state["center"][1], zoom=zoom_to_state["zoom"], pitch=0)
-        deck = pdk.Deck(layers=layers, initial_view_state=view, tooltip={"html": "<b>{Distribuidor}</b><br/>{Cidade} - {Estado}<br/>{Contato}", "style": {"color": "#000"}})
-        st.pydeck_chart(deck, use_container_width=True)
+                center_zoom = {"center": [-14.2350, -51.9253], "zoom": 5}
+        mostrar_pydeck(df_filtro, center_zoom=center_zoom, draw_polygons=desenhar_poligonos)
 
 # -----------------------------
 # FIM
 # -----------------------------
-

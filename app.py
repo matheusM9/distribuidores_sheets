@@ -1,22 +1,20 @@
-# -------------------------------------------------------------
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
-# Versão final: filtros sidebar, busca cidade com mensagem/tabela,
-# limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
-# Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
-# -------------------------------------------------------------
+# Versão: completa e otimizada com PyDeck para mapa (mantém todas as funcionalidades)
+
 import streamlit as st
 st.set_page_config(page_title="Distribuidores", layout="wide")
 
 import os
+import json
+import re
 import pandas as pd
-import folium
-from streamlit_folium import st_folium
+import pydeck as pdk
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 import requests
-import json
 import bcrypt
-import re
+
+# cookies manager
 from streamlit_cookies_manager import EncryptedCookieManager
 
 # Google Sheets
@@ -25,18 +23,24 @@ from google.oauth2.service_account import Credentials
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
 
 # -----------------------------
-# CONFIGURAÇÃO GOOGLE SHEETS
+# CONFIGURAÇÃO
 # -----------------------------
 SHEET_ID = "1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k"
 SHEET_NAME = "Página1"
 COLUNAS = ["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Latitude", "Longitude"]
 
+# Google scopes
+SCOPE = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+
+GC = None
+WORKSHEET = None
+
 # -----------------------------
 # Inicializar Google Sheets client
 # -----------------------------
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-GC = None
-WORKSHEET = None
 
 def init_gsheets():
     global GC, WORKSHEET
@@ -112,6 +116,7 @@ def carregar_dados():
 
     return df
 
+
 def salvar_dados(df):
     """Grava os dados no Google Sheets (sem cache)"""
     try:
@@ -134,7 +139,7 @@ if not cookies.ready():
     st.stop()
 
 # -----------------------------
-# CAPITAIS BRASILEIRAS
+# CAPITAIS BRASILEIRAS (para regra de alocação)
 # -----------------------------
 CAPITAIS_BRASILEIRAS = [
     "Rio Branco-AC","Maceió-AL","Macapá-AP","Manaus-AM","Salvador-BA","Fortaleza-CE",
@@ -181,18 +186,20 @@ STATE_CENTROIDS = {
 }
 
 # -----------------------------
-# FUNÇÕES AUXILIARES (IBGE + GEO)
+# IBGE + GEO helpers (cached)
 # -----------------------------
 @st.cache_data
 def carregar_estados():
     url = "https://servicodados.ibge.gov.br/api/v1/localidades/estados"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
     return sorted(resp.json(), key=lambda e: e['nome'])
 
 @st.cache_data
 def carregar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
     return sorted(resp.json(), key=lambda c: c['nome'])
 
 @st.cache_data
@@ -202,24 +209,32 @@ def carregar_todas_cidades():
     for estado in estados:
         uf = estado["sigla"]
         url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-        resp = requests.get(url)
+        resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             for c in resp.json():
                 cidades.append(f"{c['nome']} - {uf}")
     return sorted(cidades)
 
-def obter_coordenadas(cidade, estado):
-    geolocator = Nominatim(user_agent="distribuidores_app", timeout=5)
+@st.cache_data(ttl=86400)
+def obter_geojson_estados():
+    url = "https://servicodados.ibge.gov.br/api/v2/malhas/?formato=application/vnd.geo+json&qualidade=simplificada&incluir=estados"
     try:
-        location = geolocator.geocode(f"{cidade}, {estado}, Brasil")
-        if location:
-            return location.latitude, location.longitude
-        else:
-            return "", ""
-    except (GeocoderTimedOut, GeocoderUnavailable):
-        return "", ""
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            geojson = resp.json()
+            # melhorar estilo mínimo
+            for feature in geojson.get("features", []):
+                feature["properties"]["style"] = {
+                    "color": "#000000",
+                    "weight": 2,
+                    "fillOpacity": 0
+                }
+            return geojson
+    except Exception:
+        pass
+    return None
 
-@st.cache_data
+@st.cache_data(ttl=86400)
 def obter_geojson_cidade(cidade, estado_sigla):
     cidades_data = carregar_cidades(estado_sigla)
     cidade_info = next((c for c in cidades_data if c["nome"] == cidade), None)
@@ -227,145 +242,21 @@ def obter_geojson_cidade(cidade, estado_sigla):
         return None
     geojson_url = f"https://servicodados.ibge.gov.br/api/v2/malhas/{cidade_info['id']}?formato=application/vnd.geo+json&qualidade=intermediaria"
     try:
-        resp = requests.get(geojson_url, timeout=5)
+        resp = requests.get(geojson_url, timeout=10)
         if resp.status_code == 200:
             return resp.json()
-    except:
+    except Exception:
         pass
     return None
 
-@st.cache_data
-def obter_geojson_estados():
-    url = "https://servicodados.ibge.gov.br/api/v2/malhas/?formato=application/vnd.geo+json&qualidade=simplificada&incluir=estados"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            geojson = resp.json()
-            for feature in geojson.get("features", []):
-                feature["properties"]["style"] = {
-                    "color": "#000000",
-                    "weight": 3,
-                    "dashArray": "0",
-                    "fillOpacity": 0
-                }
-            return geojson
-    except:
-        pass
-    return None
+# -----------------------------
+# Utilidades
+# -----------------------------
 
 def cor_distribuidor(nome):
     h = abs(hash(nome)) % 0xAAAAAA
     h += 0x111111
     return f"#{h:06X}"
-
-# extrai coords recursivamente de geojson
-def _extract_coords_from_geojson_coords(coords, out):
-    if isinstance(coords[0], (float, int)):
-        out.append((coords[1], coords[0]))
-    else:
-        for c in coords:
-            _extract_coords_from_geojson_coords(c, out)
-
-def _centroid_and_bbox_from_feature(feature):
-    coords = []
-    geom = feature.get("geometry", {})
-    if not geom:
-        return None, None
-    _extract_coords_from_geojson_coords(geom.get("coordinates", []), coords)
-    if not coords:
-        return None, None
-    lats = [c[0] for c in coords]
-    lons = [c[1] for c in coords]
-    centroid = [sum(lats) / len(lats), sum(lons) / len(lons)]
-    bbox = [min(lats), min(lons), max(lats), max(lons)]
-    return centroid, bbox
-
-def _state_feature_by_sigla(geojson_estados, sigla):
-    for feat in geojson_estados.get("features", []):
-        props = feat.get("properties", {})
-        if props.get("sigla") == sigla or props.get("UF") == sigla or props.get("ESTADO") == sigla:
-            return feat
-    for feat in geojson_estados.get("features", []):
-        props = feat.get("properties", {})
-        nome = props.get("nome") or props.get("NOME") or ""
-        if sigla in nome:
-            return feat
-    return None
-
-def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
-    default_location = [-14.2350, -51.9253]
-    zoom_start = 5
-    if zoom_to_state and isinstance(zoom_to_state, dict):
-        center = zoom_to_state.get("center", default_location)
-        zoom_start = zoom_to_state.get("zoom", 6)
-        mapa = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron")
-    else:
-        mapa = folium.Map(location=default_location, zoom_start=zoom_start, tiles="CartoDB positron")
-
-    for _, row in df.iterrows():
-        if filtro_distribuidores and row["Distribuidor"] not in filtro_distribuidores:
-            continue
-        cidade = row.get("Cidade", "")
-        estado = row.get("Estado", "")
-        geojson = None
-        try:
-            if cidade and estado:
-                geojson = obter_geojson_cidade(cidade, estado)
-        except:
-            geojson = None
-        cor = cor_distribuidor(row.get("Distribuidor", ""))
-        if geojson and "features" in geojson:
-            try:
-                folium.GeoJson(
-                    geojson,
-                    style_function=lambda feature, cor=cor: {
-                        "fillColor": cor,
-                        "color": "#666666",
-                        "weight": 1.2,
-                        "fillOpacity": 0.55
-                    },
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})"
-                ).add_to(mapa)
-            except:
-                pass
-        else:
-            try:
-                lat = row.get("Latitude", pd.NA)
-                lon = row.get("Longitude", pd.NA)
-                if pd.isna(lat) or pd.isna(lon):
-                    continue
-                if not (-35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0):
-                    continue
-                folium.CircleMarker(
-                   location=[float(lat), float(lon)],
-                   radius=8,
-                   color="#333333",
-                   fill=True,
-                   fill_color=cor,
-                   fill_opacity=0.8,
-                   popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})"
-                ).add_to(mapa)
-            except:
-                continue
-
-    geo_estados = obter_geojson_estados()
-    if geo_estados:
-        try:
-            folium.GeoJson(
-                geo_estados,
-                name="Divisas Estaduais",
-                style_function=lambda f: f.get("properties", {}).get("style", {
-                    "color": "#000000",
-                    "weight": 3,
-                    "fillOpacity": 0
-                }),
-                tooltip=folium.GeoJsonTooltip(fields=["nome"], aliases=["Estado:"])
-            ).add_to(mapa)
-        except:
-            pass
-
-    folium.LayerControl().add_to(mapa)
-    return mapa
 
 # -----------------------------
 # LOGIN PERSISTENTE
@@ -424,6 +315,7 @@ if "cidade_busca" not in st.session_state:
 menu = ["Cadastro", "Lista / Editar / Excluir", "Mapa"]
 choice = st.sidebar.radio("Navegação", menu)
 
+# validações
 def validar_telefone(tel):
     padrao = r'^\(\d{2}\) \d{4,5}-\d{4}$'
     return re.match(padrao, tel)
@@ -468,17 +360,18 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                 st.error("As seguintes cidades já estão atribuídas a outros distribuidores:\n" + "\n".join(cidades_ocupadas))
             else:
                 novos = []
+                geolocator = Nominatim(user_agent="distribuidores_app", timeout=5)
                 for c in cidades_sel:
-                    lat, lon = obter_coordenadas(c, estado_sel)
                     try:
-                        if lat is None or lon is None or lat == "" or lon == "":
-                            lat_v, lon_v = pd.NA, pd.NA
-                        else:
-                            lat_v = float(str(lat).replace(",", "."))
-                            lon_v = float(str(lon).replace(",", "."))
+                        location = geolocator.geocode(f"{c}, {estado_sel}, Brasil")
+                        if location:
+                            lat_v = float(str(location.latitude).replace(",", "."))
+                            lon_v = float(str(location.longitude).replace(",", "."))
                             if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
                                 lat_v, lon_v = pd.NA, pd.NA
-                    except:
+                        else:
+                            lat_v, lon_v = pd.NA, pd.NA
+                    except (GeocoderTimedOut, GeocoderUnavailable, Exception):
                         lat_v, lon_v = pd.NA, pd.NA
                     novos.append([nome, contato, email, estado_sel, c, lat_v, lon_v])
                 novo_df = pd.DataFrame(novos, columns=COLUNAS)
@@ -527,17 +420,18 @@ elif choice == "Lista / Editar / Excluir":
                         else:
                             st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_edit]
                             novos = []
+                            geolocator = Nominatim(user_agent="distribuidores_app", timeout=5)
                             for cidade in cidades_novas:
-                                lat, lon = obter_coordenadas(cidade, estado_edit)
                                 try:
-                                    if lat is None or lon is None or lat == "" or lon == "":
-                                        lat_v, lon_v = pd.NA, pd.NA
-                                    else:
-                                        lat_v = float(str(lat).replace(",", "."))
-                                        lon_v = float(str(lon).replace(",", "."))
+                                    location = geolocator.geocode(f"{cidade}, {estado_edit}, Brasil")
+                                    if location:
+                                        lat_v = float(str(location.latitude).replace(",", "."))
+                                        lon_v = float(str(location.longitude).replace(",", "."))
                                         if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
                                             lat_v, lon_v = pd.NA, pd.NA
-                                except:
+                                    else:
+                                        lat_v, lon_v = pd.NA, pd.NA
+                                except (GeocoderTimedOut, GeocoderUnavailable, Exception):
                                     lat_v, lon_v = pd.NA, pd.NA
                                 novos.append([nome_edit, contato_edit, email_edit, estado_edit, cidade, lat_v, lon_v])
                             novo_df = pd.DataFrame(novos, columns=COLUNAS)
@@ -556,7 +450,7 @@ elif choice == "Lista / Editar / Excluir":
                     st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
-# MAPA (filtros na sidebar, com busca de cidade mostrando mensagens/tabela)
+# MAPA (com pydeck otimizado)
 # =============================
 elif choice == "Mapa":
     st.subheader("🗺️ Mapa de Distribuidores")
@@ -575,7 +469,7 @@ elif choice == "Mapa":
     # Estado (com opção vazia)
     estados = carregar_estados()
     siglas = [e["sigla"] for e in estados]
-    estado_filtro = st.sidebar.selectbox("Filtrar por Estado", [""] + siglas, index=(0 if st.session_state.estado_filtro == "" else ([""] + siglas).index(st.session_state.estado_filtro)))
+    estado_filtro = st.sidebar.selectbox("Filtrar por Estado", [""] + siglas, index=(0 if st.session_state.estado_filtro == "" else ( [""] + siglas ).index(st.session_state.estado_filtro)))
     st.session_state.estado_filtro = estado_filtro
 
     # Opções do multiselect Filtrar Distribuidores
@@ -603,14 +497,45 @@ elif choice == "Mapa":
         st.session_state.distribuidores_selecionados = []
         st.session_state.cidade_busca = ""
 
+    # Opção: desenhar polígonos (pode ser lento) - default desligado para performance
+    desenhar_poligonos = st.sidebar.checkbox("Desenhar polígonos (pode ser lento)", value=False)
+
     # Aplicar filtros combinados
     df_filtro = st.session_state.df.copy()
-
     if st.session_state.estado_filtro:
         df_filtro = df_filtro[df_filtro["Estado"] == st.session_state.estado_filtro]
-
     if st.session_state.distribuidores_selecionados:
         df_filtro = df_filtro[df_filtro["Distribuidor"].isin(st.session_state.distribuidores_selecionados)]
+
+    # Token Mapbox (opcional) - se disponível em secrets, configura para pydeck
+    if "MAPBOX_API_KEY" in st.secrets:
+        pdk.settings.mapbox_api_key = st.secrets["MAPBOX_API_KEY"]
+
+    # Função para calcular zoom/centro baseado em lats/lons
+    def calcular_zoom_e_centro(df_local):
+        lats = pd.to_numeric(df_local["Latitude"], errors="coerce").dropna()
+        lons = pd.to_numeric(df_local["Longitude"], errors="coerce").dropna()
+        lats = lats[(lats >= -35.0) & (lats <= 6.0)]
+        lons = lons[(lons >= -82.0) & (lons <= -30.0)]
+        if not lats.empty and not lons.empty:
+            center_lat = float(lats.mean())
+            center_lon = float(lons.mean())
+            lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
+            lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
+            span = max(lat_span, lon_span)
+            if span < 0.02:
+                zoom = 13
+            elif span < 0.2:
+                zoom = 11
+            elif span < 1.0:
+                zoom = 9
+            elif span < 3.0:
+                zoom = 8
+            else:
+                zoom = 6
+            return {"center": [center_lat, center_lon], "zoom": zoom}
+        else:
+            return None
 
     # Se houve busca de cidade (prioridade de exibição de mensagem/tabela)
     if st.session_state.cidade_busca:
@@ -623,114 +548,129 @@ elif choice == "Mapa":
         except Exception:
             df_cidade = pd.DataFrame(columns=COLUNAS)
 
-        # Mensagem e tabela conforme comportamento desejado
         if df_cidade.empty:
             st.warning(f"❌ Nenhum distribuidor encontrado em **{st.session_state.cidade_busca}**.")
-            # Mesmo quando não há distribuidores, mostra mapa centrado no estado (se escolhido) ou no BR
-            # Determinar zoom_to_state (mesma lógica abaixo)
+            # Mostrar mapa vazio centrado no estado ou BR
             zoom_to_state = None
             if st.session_state.estado_filtro:
                 df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
-                lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
-                lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
-                lats = lats[(lats >= -35.0) & (lats <= 6.0)]
-                lons = lons[(lons >= -82.0) & (lons <= -30.0)]
-                if not lats.empty and not lons.empty:
-                    center_lat = float(lats.mean())
-                    center_lon = float(lons.mean())
-                    lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
-                    lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
-                    span = max(lat_span, lon_span)
-                    if span < 0.2:
-                        zoom = 11
-                    elif span < 1.0:
-                        zoom = 9
-                    elif span < 3.0:
-                        zoom = 8
-                    else:
-                        zoom = 6
-                    zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
-                else:
-                    if st.session_state.estado_filtro in STATE_CENTROIDS:
-                        zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
-                    else:
-                        zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+                zoom_to_state = calcular_zoom_e_centro(df_state)
+                if not zoom_to_state:
+                    zoom_to_state = STATE_CENTROIDS.get(st.session_state.estado_filtro, {"center": [-14.2350, -51.9253], "zoom": 5})
             else:
                 zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
 
-            mapa = criar_mapa(pd.DataFrame(columns=COLUNAS), filtro_distribuidores=None, zoom_to_state=zoom_to_state)
-            st_folium(mapa, width=1200, height=700)
+            # montar pydeck vazio
+            view = pdk.ViewState(latitude=zoom_to_state["center"][0], longitude=zoom_to_state["center"][1], zoom=zoom_to_state["zoom"], pitch=0)
+            deck = pdk.Deck(initial_view_state=view, layers=[])
+            st.pydeck_chart(deck, use_container_width=True)
         else:
             st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{st.session_state.cidade_busca}**:")
-            # Mostrar tabela com Distribuidor, Contato, Email
             st.dataframe(df_cidade[["Distribuidor", "Contato", "Email"]].reset_index(drop=True), use_container_width=True)
 
-            # Criar mapa apenas com df_cidade (aplica filtro de distribuidores caso tenham sido selecionados)
+            # filtrar distribuidores selecionados se houver
             df_cidade_map = df_cidade.copy()
             if st.session_state.distribuidores_selecionados:
                 df_cidade_map = df_cidade_map[df_cidade_map["Distribuidor"].isin(st.session_state.distribuidores_selecionados)]
 
-            # calcular zoom centrado em df_cidade_map (se tem coords válidas)
-            zoom_to_state = None
-            lats = pd.to_numeric(df_cidade_map["Latitude"], errors="coerce").dropna()
-            lons = pd.to_numeric(df_cidade_map["Longitude"], errors="coerce").dropna()
-            lats = lats[(lats >= -35.0) & (lats <= 6.0)]
-            lons = lons[(lons >= -82.0) & (lons <= -30.0)]
-            if not lats.empty and not lons.empty:
-                center_lat = float(lats.mean())
-                center_lon = float(lons.mean())
-                lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.02
-                lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.02
-                span = max(lat_span, lon_span)
-                if span < 0.02:
-                    zoom = 13
-                elif span < 0.2:
-                    zoom = 11
-                elif span < 1.0:
-                    zoom = 9
-                else:
-                    zoom = 8
-                zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
-            else:
-                # fallback para estado ou centro do Brasil
+            # preparar dados para pydeck: remover linhas sem coords válidas
+            df_pts = df_cidade_map.copy()
+            df_pts["Latitude"] = pd.to_numeric(df_pts["Latitude"], errors="coerce")
+            df_pts["Longitude"] = pd.to_numeric(df_pts["Longitude"], errors="coerce")
+            df_pts = df_pts.dropna(subset=["Latitude", "Longitude"])
+
+            zoom_to_state = calcular_zoom_e_centro(df_pts)
+            if not zoom_to_state:
                 if st.session_state.estado_filtro and st.session_state.estado_filtro in STATE_CENTROIDS:
                     zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
                 else:
                     zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
 
-            mapa = criar_mapa(df_cidade_map, filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
-            st_folium(mapa, width=1200, height=700)
+            # Criar camadas pydeck
+            layers = []
+
+            if desenhar_poligonos:
+                # tentar buscar geojson da cidade (apenas uma vez por cidade)
+                geo = obter_geojson_cidade(cidade_nome, estado_sigla)
+                if geo:
+                    layers.append(pdk.Layer("GeoJsonLayer", data=geo, pickable=False, stroked=True, filled=True, get_fill_color="[100,100,200,60]", get_line_color="[0,0,0]") )
+
+            if not df_pts.empty:
+                df_pts = df_pts.rename(columns={"Longitude": "lon", "Latitude": "lat"})
+                # cor por distribuidor através de código hex -> rgb
+                def hex_to_rgb(hexcol):
+                    hexcol = hexcol.lstrip('#')
+                    return [int(hexcol[i:i+2], 16) for i in (0, 2, 4)]
+                df_pts["color_rgb"] = df_pts["Distribuidor"].apply(lambda n: hex_to_rgb(cor_distribuidor(n)))
+
+                scatter = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=df_pts,
+                    get_position=["lon", "lat"],
+                    get_fill_color="color_rgb",
+                    get_radius=500,
+                    radius_scale=1,
+                    pickable=True,
+                    auto_highlight=True,
+                )
+                layers.append(scatter)
+
+            # incluir limites estaduais (leve) - cacheado
+            if desenhar_poligonos:
+                geo_estados = obter_geojson_estados()
+                if geo_estados:
+                    layers.append(pdk.Layer("GeoJsonLayer", data=geo_estados, pickable=False, stroked=True, filled=False, get_line_color=[0,0,0], get_line_width=1))
+
+            view = pdk.ViewState(latitude=zoom_to_state["center"][0], longitude=zoom_to_state["center"][1], zoom=zoom_to_state["zoom"], pitch=0)
+            deck = pdk.Deck(layers=layers, initial_view_state=view, tooltip={"html": "<b>{Distribuidor}</b><br/>{Cidade} - {Estado}<br/>{Contato}", "style": {"color": "#000"}})
+            st.pydeck_chart(deck, use_container_width=True)
+
     else:
         # Sem busca por cidade: aplicar filtros combinados e mostrar mapa geral
-        # df_filtro já aplicado por estado e por distribuidores selecionados acima
-        # Determinar zoom/centro de forma robusta (evitar Antártida)
-        zoom_to_state = None
-        if st.session_state.estado_filtro:
-            df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
-            lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
-            lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
-            lats = lats[(lats >= -35.0) & (lats <= 6.0)]
-            lons = lons[(lons >= -82.0) & (lons <= -30.0)]
-            if not lats.empty and not lons.empty:
-                center_lat = float(lats.mean())
-                center_lon = float(lons.mean())
-                lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
-                lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
-                span = max(lat_span, lon_span)
-                if span < 0.2:
-                    zoom = 11
-                elif span < 1.0:
-                    zoom = 9
-                elif span < 3.0:
-                    zoom = 8
-                else:
-                    zoom = 6
-                zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
-            else:
-                if st.session_state.estado_filtro in STATE_CENTROIDS:
-                    zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
-                else:
-                    zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+        df_filtro = df_filtro.copy()
+        # preparar pontos
+        df_pts = df_filtro.copy()
+        df_pts["Latitude"] = pd.to_numeric(df_pts["Latitude"], errors="coerce")
+        df_pts["Longitude"] = pd.to_numeric(df_pts["Longitude"], errors="coerce")
+        df_pts = df_pts.dropna(subset=["Latitude", "Longitude"])            
 
-        mapa = criar_mapa(df_filtro, filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
-        st_folium(mapa, width=1200, height=700)
+        zoom_to_state = calcular_zoom_e_centro(df_filtro)
+        if not zoom_to_state:
+            if st.session_state.estado_filtro and st.session_state.estado_filtro in STATE_CENTROIDS:
+                zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
+            else:
+                zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+
+        layers = []
+        if desenhar_poligonos:
+            geo_estados = obter_geojson_estados()
+            if geo_estados:
+                layers.append(pdk.Layer("GeoJsonLayer", data=geo_estados, pickable=False, stroked=True, filled=False, get_line_color=[0,0,0], get_line_width=1))
+
+        if not df_pts.empty:
+            df_pts = df_pts.rename(columns={"Longitude": "lon", "Latitude": "lat"})
+            def hex_to_rgb(hexcol):
+                hexcol = hexcol.lstrip('#')
+                return [int(hexcol[i:i+2], 16) for i in (0, 2, 4)]
+            df_pts["color_rgb"] = df_pts["Distribuidor"].apply(lambda n: hex_to_rgb(cor_distribuidor(n)))
+
+            scatter = pdk.Layer(
+                "ScatterplotLayer",
+                data=df_pts,
+                get_position=["lon", "lat"],
+                get_fill_color="color_rgb",
+                get_radius=500,
+                radius_scale=1,
+                pickable=True,
+                auto_highlight=True,
+            )
+            layers.append(scatter)
+
+        view = pdk.ViewState(latitude=zoom_to_state["center"][0], longitude=zoom_to_state["center"][1], zoom=zoom_to_state["zoom"], pitch=0)
+        deck = pdk.Deck(layers=layers, initial_view_state=view, tooltip={"html": "<b>{Distribuidor}</b><br/>{Cidade} - {Estado}<br/>{Contato}", "style": {"color": "#000"}})
+        st.pydeck_chart(deck, use_container_width=True)
+
+# -----------------------------
+# FIM
+# -----------------------------
+

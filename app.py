@@ -1,17 +1,21 @@
 # app.py
 # -------------------------------------------------------------
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
-# Versão otimizada: filtros sidebar, busca cidade com mensagem/tabela,
-# limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
-# Melhorias de performance: cluster de marcadores, cache agressivo,
-# evitar múltiplas consultas geojson por linha, minimizar geocoding.
+# Versão final completa:
+# - Cadastro, Listar/Editar/Excluir, Mapa com busca por cidade
+# - Sanitização de lat/lon (vírgulas, espaços, textos)
+# - Geocoding apenas quando necessário (ao adicionar/editar)
+# - **Salva automaticamente** coordenadas geocodificadas de volta na planilha
+# - Cache para IBGE/GeoJSON, mapas com clustering para performance
 # -------------------------------------------------------------
 
 import os
 import json
 import re
+import time
 import requests
 import pandas as pd
+import numpy as np
 import folium
 import bcrypt
 from geopy.geocoders import Nominatim
@@ -50,6 +54,7 @@ WORKSHEET = None
 
 
 def init_gsheets():
+    """Inicializa cliente gspread e garante a aba existir."""
     global GC, WORKSHEET
     if "gcp_service_account" not in st.secrets:
         st.error("❌ Google Service Account não configurada nos Secrets do Streamlit Cloud.")
@@ -93,6 +98,7 @@ def carregar_dados():
         return df
 
     df = pd.DataFrame(records)
+    # Garantir colunas mínimas
     for col in COLUNAS:
         if col not in df.columns:
             df[col] = ""
@@ -101,17 +107,22 @@ def carregar_dados():
 
     # Sanitizar Latitude/Longitude: converter para número, aceitar apenas faixa do Brasil
     def to_float_safe(x):
-        if x is None:
+        if pd.isna(x):
             return pd.NA
         if isinstance(x, (int, float)):
             return float(x)
         s = str(x).strip()
-        if s == "":
+        if s == "" or s.lower() in ["nan", "none", "null"]:
             return pd.NA
+        # remover espaços e símbolos comuns
+        s = s.replace(" ", "").replace("\u200b", "")
         s = s.replace(",", ".")
-        s = s.replace(" ", "")
+        # extrair primeiro número válido com regex (ex: "-23.550520")
+        m = re.search(r'-?\d+[.,]?\d*', s)
+        if not m:
+            return pd.NA
         try:
-            return float(s)
+            return float(m.group(0).replace(",", "."))
         except:
             return pd.NA
 
@@ -125,22 +136,89 @@ def carregar_dados():
     return df
 
 
-def salvar_dados(df, preserve_cache_clear=True):
-    """Grava os dados no Google Sheets (sem cache)"""
+def salvar_dados_local_e_sheet(df, write_back=True):
+    """
+    Grava os dados no Google Sheets (substitui todo o conteúdo da aba).
+    Use com cuidado: sobrescreve a aba com o dataframe atual.
+    """
     try:
         df2 = df.copy()
         df2 = df2[COLUNAS].fillna("")
         WORKSHEET.clear()
         WORKSHEET.update([df2.columns.values.tolist()] + df2.values.tolist())
         # limpar cache do carregamento de dados
-        if preserve_cache_clear:
-            try:
-                # st.cache_data.clear() API
-                st.cache_data.clear()
-            except Exception:
-                pass
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
     except Exception as e:
         st.error("Erro ao salvar dados na planilha: " + str(e))
+
+
+def atualizar_coord_na_planilha(cidade, estado, lat, lon):
+    """
+    Atualiza na planilha todas as linhas que têm a mesma Cidade e Estado e que
+    tenham Latitude ou Longitude em branco. Retorna número de linhas atualizadas.
+    Esta função busca os valores brutos (get_all_values) para preservar formato.
+    """
+    try:
+        vals = WORKSHEET.get_all_values()
+        if not vals or len(vals) == 0:
+            return 0
+        header = vals[0]
+        # localizar índices (1-based)
+        try:
+            idx_cidade = [h.strip() for h in header].index("Cidade") + 1
+            idx_estado = [h.strip() for h in header].index("Estado") + 1
+            idx_lat = [h.strip() for h in header].index("Latitude") + 1
+            idx_lon = [h.strip() for h in header].index("Longitude") + 1
+        except ValueError:
+            # cabeçalho diferente: tentar encontrar por palavras-chave
+            header_low = [h.strip().lower() for h in header]
+            idx_cidade = next((i+1 for i,h in enumerate(header_low) if "cid" in h), None)
+            idx_estado = next((i+1 for i,h in enumerate(header_low) if "est" in h and len(h) <= 3), None)
+            idx_lat = next((i+1 for i,h in enumerate(header_low) if "lat" in h), None)
+            idx_lon = next((i+1 for i,h in enumerate(header_low) if "lon" in h or "long" in h), None)
+            if not idx_cidade or not idx_estado or not idx_lat or not idx_lon:
+                return 0
+
+        updated = 0
+        # percorrer linhas (1-based): header é linha 1
+        for row_idx in range(2, len(vals)+1):
+            row = vals[row_idx-1]
+            try:
+                cell_cidade = row[idx_cidade-1].strip()
+                cell_estado = row[idx_estado-1].strip()
+            except Exception:
+                continue
+            if cell_cidade.lower() == cidade.lower() and cell_estado.upper() == estado.upper():
+                # ver se lat/lon estão vazios
+                cell_lat = row[idx_lat-1].strip() if idx_lat-1 < len(row) else ""
+                cell_lon = row[idx_lon-1].strip() if idx_lon-1 < len(row) else ""
+                if cell_lat == "" or cell_lon == "":
+                    try:
+                        WORKSHEET.update_cell(row_idx, idx_lat, float(lat))
+                        WORKSHEET.update_cell(row_idx, idx_lon, float(lon))
+                        updated += 1
+                    except Exception:
+                        # se falhar, tentar como string
+                        try:
+                            WORKSHEET.update_cell(row_idx, idx_lat, str(lat))
+                            WORKSHEET.update_cell(row_idx, idx_lon, str(lon))
+                            updated += 1
+                        except:
+                            pass
+        if updated > 0:
+            # limpar cache para refletir novas coords
+            try:
+                st.cache_data.clear()
+            except:
+                pass
+        return updated
+    except Exception as e:
+        # não interrompe o app se atualização falhar
+        st.warning("Atenção: não foi possível atualizar coordenadas na planilha: " + str(e))
+        return 0
 
 
 # -----------------------------
@@ -237,28 +315,31 @@ def carregar_todas_cidades():
 
 def obter_coordenadas(cidade, estado):
     """
-    Função de geocoding: usada APENAS quando o usuário adiciona/edita
-    distribuidores e a planilha não tem coords — evita geocodificar no render.
+    Geocode usando Nominatim (apenas quando necessário).
+    Retorna (lat, lon) ou (pd.NA, pd.NA) em falha.
     """
-    geolocator = Nominatim(user_agent="distribuidores_app", timeout=5)
+    geolocator = Nominatim(user_agent="distribuidores_app", timeout=6)
     try:
-        location = geolocator.geocode(f"{cidade}, {estado}, Brasil")
+        # tentativa com "Cidade, UF, Brasil"
+        query = f"{cidade}, {estado}, Brasil"
+        location = geolocator.geocode(query)
+        if not location:
+            # tentar "Cidade - UF, Brasil" ou apenas cidade + brasil
+            location = geolocator.geocode(f"{cidade}, Brasil")
         if location:
             return location.latitude, location.longitude
         else:
-            return "", ""
+            return pd.NA, pd.NA
     except (GeocoderTimedOut, GeocoderUnavailable):
-        return "", ""
+        return pd.NA, pd.NA
+    except Exception:
+        return pd.NA, pd.NA
 
 
 @st.cache_data
 def obter_geojson_cidade(cidade, estado_sigla):
-    """
-    Busca e cacheia o GeoJSON da malha municipal (qualidade intermediária).
-    Chamamos ESSA função apenas quando o usuário seleciona uma cidade específica.
-    """
     cidades_data = carregar_cidades(estado_sigla)
-    cidade_info = next((c for c in cidades_data if c["nome"] == cidade), None)
+    cidade_info = next((c for c in cidades_data if c["nome"].lower() == cidade.lower()), None)
     if not cidade_info:
         return None
     geojson_url = (
@@ -269,16 +350,13 @@ def obter_geojson_cidade(cidade, estado_sigla):
         resp = requests.get(geojson_url, timeout=10)
         if resp.status_code == 200:
             return resp.json()
-    except Exception:
+    except:
         pass
     return None
 
 
 @st.cache_data
 def obter_geojson_estados():
-    """
-    Carrega uma versão simplificada das malhas estaduais (uma única vez).
-    """
     url = (
         "https://servicodados.ibge.gov.br/api/v2/malhas/"
         "?formato=application/vnd.geo+json&qualidade=simplificada&incluir=estados"
@@ -306,9 +384,43 @@ def cor_distribuidor(nome):
     return f"#{h:06X}"
 
 
-# -----------------------------
-# MAPA - PRINCIPAL (otimizado)
-# -----------------------------
+# extrai coords recursivamente de geojson
+def _extract_coords_from_geojson_coords(coords, out):
+    if isinstance(coords[0], (float, int)):
+        out.append((coords[1], coords[0]))
+    else:
+        for c in coords:
+            _extract_coords_from_geojson_coords(c, out)
+
+
+def _centroid_and_bbox_from_feature(feature):
+    coords = []
+    geom = feature.get("geometry", {})
+    if not geom:
+        return None, None
+    _extract_coords_from_geojson_coords(geom.get("coordinates", []), coords)
+    if not coords:
+        return None, None
+    lats = [c[0] for c in coords]
+    lons = [c[1] for c in coords]
+    centroid = [sum(lats) / len(lats), sum(lons) / len(lons)]
+    bbox = [min(lats), min(lons), max(lats), max(lons)]
+    return centroid, bbox
+
+
+def _state_feature_by_sigla(geojson_estados, sigla):
+    for feat in geojson_estados.get("features", []):
+        props = feat.get("properties", {})
+        if props.get("sigla") == sigla or props.get("UF") == sigla or props.get("ESTADO") == sigla:
+            return feat
+    for feat in geojson_estados.get("features", []):
+        props = feat.get("properties", {})
+        nome = props.get("nome") or props.get("NOME") or ""
+        if sigla in nome:
+            return feat
+    return None
+
+
 def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None, show_state_borders=True, use_fast_cluster=True):
     """
     Cria mapa folium otimizado:
@@ -333,7 +445,6 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None, show_state_bo
 
     # Preparar lista de pontos válidos (para cluster)
     pontos = []
-    # também manter popup simples por ponto (para FastMarkerCluster não aceita popups diretamente)
     popups = []
 
     for _, row in df_iter.iterrows():
@@ -356,10 +467,8 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None, show_state_bo
     if pontos:
         try:
             if use_fast_cluster and len(pontos) > 40:
-                # FastMarkerCluster aceita lista de [lat, lon]; ele é muito rápido
                 FastMarkerCluster(pontos).add_to(mapa)
             else:
-                # MarkerCluster com CircleMarker (mais controlável)
                 mc = MarkerCluster()
                 for i, pt in enumerate(pontos):
                     folium.CircleMarker(
@@ -373,7 +482,6 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None, show_state_bo
                     ).add_to(mc)
                 mc.add_to(mapa)
         except Exception:
-            # fallback: desenhar círculos simples
             for i, pt in enumerate(pontos):
                 folium.CircleMarker(
                     location=pt,
@@ -516,10 +624,10 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                 )
             else:
                 novos = []
+                atualizacoes_feitas = 0
                 for c in cidades_sel:
-                    # Geocodificar SOMENTE quando necessário (planilha não tem coords)
+                    # Reaproveitar coords existentes para a mesma cidade/estado
                     lat_v, lon_v = pd.NA, pd.NA
-                    # tentar buscar coords via tabela (caso exista alguma linha com mesma cidade/estado)
                     match_mask = (
                         (st.session_state.df["Cidade"].str.lower() == c.lower()) &
                         (st.session_state.df["Estado"].str.upper() == estado_sel.upper())
@@ -530,24 +638,32 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                             lat_v = row_match["Latitude"]
                             lon_v = row_match["Longitude"]
                     else:
+                        # geocodificar só quando NÃO existe coord
                         lat, lon = obter_coordenadas(c, estado_sel)
-                        try:
-                            if lat is None or lon is None or lat == "" or lon == "":
-                                lat_v, lon_v = pd.NA, pd.NA
-                            else:
-                                lat_v = float(str(lat).replace(",", "."))
-                                lon_v = float(str(lon).replace(",", "."))
+                        if not pd.isna(lat) and not pd.isna(lon):
+                            try:
+                                lat_v = float(lat)
+                                lon_v = float(lon)
                                 if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
                                     lat_v, lon_v = pd.NA, pd.NA
-                        except:
+                                else:
+                                    # salva de volta na planilha para linhas correspondentes (se existirem)
+                                    updated = atualizar_coord_na_planilha(c, estado_sel, lat_v, lon_v)
+                                    atualizacoes_feitas += updated
+                            except:
+                                lat_v, lon_v = pd.NA, pd.NA
+                        else:
                             lat_v, lon_v = pd.NA, pd.NA
                     novos.append([nome, contato, email, estado_sel, c, lat_v, lon_v])
+                    # bom practice: aguardar um pouco entre geocodes para evitar bloqueio
+                    time.sleep(0.5)
                 novo_df = pd.DataFrame(novos, columns=COLUNAS)
                 st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
-                salvar_dados(st.session_state.df)
+                # salvar tudo de volta na planilha: mantemos gravação completa para garantir integridade
+                salvar_dados_local_e_sheet(st.session_state.df)
+                # recarregar dados a partir da planilha (limpa cache)
                 st.session_state.df = carregar_dados()
-                st.success(f"✅ Distribuidor '{nome}' adicionado!")
-
+                st.success(f"✅ Distribuidor '{nome}' adicionado! Coordenadas atualizadas na planilha: {atualizacoes_feitas}")
 
 # =============================
 # LISTA / EDITAR / EXCLUIR
@@ -593,9 +709,9 @@ elif choice == "Lista / Editar / Excluir":
                         else:
                             st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_edit]
                             novos = []
+                            atualizacoes_feitas = 0
                             for cidade in cidades_novas:
                                 lat_v, lon_v = pd.NA, pd.NA
-                                # tentar reaproveitar coords existentes para a mesma cidade/estado
                                 match_mask = (
                                     (st.session_state.df["Cidade"].str.lower() == cidade.lower()) &
                                     (st.session_state.df["Estado"].str.upper() == estado_edit.upper())
@@ -607,32 +723,35 @@ elif choice == "Lista / Editar / Excluir":
                                         lon_v = row_match["Longitude"]
                                 else:
                                     lat, lon = obter_coordenadas(cidade, estado_edit)
-                                    try:
-                                        if lat is None or lon is None or lat == "" or lon == "":
-                                            lat_v, lon_v = pd.NA, pd.NA
-                                        else:
-                                            lat_v = float(str(lat).replace(",", "."))
-                                            lon_v = float(str(lon).replace(",", "."))
+                                    if not pd.isna(lat) and not pd.isna(lon):
+                                        try:
+                                            lat_v = float(lat)
+                                            lon_v = float(lon)
                                             if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
                                                 lat_v, lon_v = pd.NA, pd.NA
-                                    except:
+                                            else:
+                                                updated = atualizar_coord_na_planilha(cidade, estado_edit, lat_v, lon_v)
+                                                atualizacoes_feitas += updated
+                                        except:
+                                            lat_v, lon_v = pd.NA, pd.NA
+                                    else:
                                         lat_v, lon_v = pd.NA, pd.NA
                                 novos.append([nome_edit, contato_edit, email_edit, estado_edit, cidade, lat_v, lon_v])
+                                time.sleep(0.5)
                             novo_df = pd.DataFrame(novos, columns=COLUNAS)
                             st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
-                            salvar_dados(st.session_state.df)
+                            salvar_dados_local_e_sheet(st.session_state.df)
                             st.session_state.df = carregar_dados()
-                            st.success("✅ Alterações salvas!")
+                            st.success(f"✅ Alterações salvas! Coordenadas atualizadas na planilha: {atualizacoes_feitas}")
 
         with st.expander("🗑️ Excluir"):
             if not st.session_state.df.empty:
                 dist_del = st.selectbox("Distribuidor para excluir", st.session_state.df["Distribuidor"].unique())
                 if st.button("Excluir Distribuidor"):
                     st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_del]
-                    salvar_dados(st.session_state.df)
+                    salvar_dados_local_e_sheet(st.session_state.df)
                     st.session_state.df = carregar_dados()
                     st.success(f"🗑️ '{dist_del}' removido!")
-
 
 # =============================
 # MAPA (filtros na sidebar, com busca de cidade mostrando mensagens/tabela)
@@ -758,7 +877,7 @@ elif choice == "Mapa":
                 df_cidade_map = df_cidade_map[df_cidade_map["Distribuidor"].isin(
                     st.session_state.distribuidores_selecionados)]
 
-            # Se cidade selecionada, tentamos desenhar a malha municipal (apenas uma vez via cache)
+            # Se cidade selecionada, tentamos desenhar a malha municipal (apenas UMA vez via cache)
             geojson = None
             try:
                 cidade_nome_simple = cidade_nome.strip()
@@ -821,8 +940,6 @@ elif choice == "Mapa":
             st_folium(mapa, width=1200, height=700)
     else:
         # Sem busca por cidade: aplicar filtros combinados e mostrar mapa geral
-        # df_filtro já aplicado por estado e por distribuidores selecionados acima
-        # Determinar zoom/centro de forma robusta (evitar Antártida)
         zoom_to_state = None
         if st.session_state.estado_filtro:
             df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
@@ -860,3 +977,10 @@ elif choice == "Mapa":
             use_fast_cluster=True
         )
         st_folium(mapa, width=1200, height=700)
+
+# -----------------------------
+# RODAPÉ / AJUDAS
+# -----------------------------
+st.divider()
+st.caption("💡 Dica: adicione distribuidores na aba 'Cadastro'. Se coordenadas estiverem faltando, o app "
+           "irá tentar geocodificar e gravar automaticamente na planilha.")

@@ -1,8 +1,10 @@
+# app.py
 # -------------------------------------------------------------
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
-# Versão final: filtros sidebar, busca cidade com mensagem/tabela,
+# Versão otimizada: filtros sidebar, busca cidade com mensagem/tabela,
 # limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
-# Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
+# Melhorias de performance: cluster de marcadores, cache agressivo,
+# evitar múltiplas consultas geojson por linha, minimizar geocoding.
 # -------------------------------------------------------------
 
 import os
@@ -18,6 +20,9 @@ from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 import streamlit as st
 from streamlit_folium import st_folium
 from streamlit_cookies_manager import EncryptedCookieManager
+
+# Folium plugins
+from folium.plugins import MarkerCluster, FastMarkerCluster
 
 # Google Sheets
 import gspread
@@ -120,7 +125,7 @@ def carregar_dados():
     return df
 
 
-def salvar_dados(df):
+def salvar_dados(df, preserve_cache_clear=True):
     """Grava os dados no Google Sheets (sem cache)"""
     try:
         df2 = df.copy()
@@ -128,10 +133,12 @@ def salvar_dados(df):
         WORKSHEET.clear()
         WORKSHEET.update([df2.columns.values.tolist()] + df2.values.tolist())
         # limpar cache do carregamento de dados
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
+        if preserve_cache_clear:
+            try:
+                # st.cache_data.clear() API
+                st.cache_data.clear()
+            except Exception:
+                pass
     except Exception as e:
         st.error("Erro ao salvar dados na planilha: " + str(e))
 
@@ -201,14 +208,16 @@ STATE_CENTROIDS = {
 @st.cache_data
 def carregar_estados():
     url = "https://servicodados.ibge.gov.br/api/v1/localidades/estados"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=8)
+    resp.raise_for_status()
     return sorted(resp.json(), key=lambda e: e["nome"])
 
 
 @st.cache_data
 def carregar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=8)
+    resp.raise_for_status()
     return sorted(resp.json(), key=lambda c: c["nome"])
 
 
@@ -219,7 +228,7 @@ def carregar_todas_cidades():
     for estado in estados:
         uf = estado["sigla"]
         url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-        resp = requests.get(url)
+        resp = requests.get(url, timeout=8)
         if resp.status_code == 200:
             for c in resp.json():
                 cidades.append(f"{c['nome']} - {uf}")
@@ -227,6 +236,10 @@ def carregar_todas_cidades():
 
 
 def obter_coordenadas(cidade, estado):
+    """
+    Função de geocoding: usada APENAS quando o usuário adiciona/edita
+    distribuidores e a planilha não tem coords — evita geocodificar no render.
+    """
     geolocator = Nominatim(user_agent="distribuidores_app", timeout=5)
     try:
         location = geolocator.geocode(f"{cidade}, {estado}, Brasil")
@@ -240,6 +253,10 @@ def obter_coordenadas(cidade, estado):
 
 @st.cache_data
 def obter_geojson_cidade(cidade, estado_sigla):
+    """
+    Busca e cacheia o GeoJSON da malha municipal (qualidade intermediária).
+    Chamamos ESSA função apenas quando o usuário seleciona uma cidade específica.
+    """
     cidades_data = carregar_cidades(estado_sigla)
     cidade_info = next((c for c in cidades_data if c["nome"] == cidade), None)
     if not cidade_info:
@@ -249,28 +266,31 @@ def obter_geojson_cidade(cidade, estado_sigla):
         "?formato=application/vnd.geo+json&qualidade=intermediaria"
     )
     try:
-        resp = requests.get(geojson_url, timeout=5)
+        resp = requests.get(geojson_url, timeout=10)
         if resp.status_code == 200:
             return resp.json()
-    except:
+    except Exception:
         pass
     return None
 
 
 @st.cache_data
 def obter_geojson_estados():
+    """
+    Carrega uma versão simplificada das malhas estaduais (uma única vez).
+    """
     url = (
         "https://servicodados.ibge.gov.br/api/v2/malhas/"
         "?formato=application/vnd.geo+json&qualidade=simplificada&incluir=estados"
     )
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=12)
         if resp.status_code == 200:
             geojson = resp.json()
             for feature in geojson.get("features", []):
                 feature["properties"]["style"] = {
                     "color": "#000000",
-                    "weight": 3,
+                    "weight": 2,
                     "dashArray": "0",
                     "fillOpacity": 0,
                 }
@@ -286,115 +306,102 @@ def cor_distribuidor(nome):
     return f"#{h:06X}"
 
 
-# extrai coords recursivamente de geojson
-def _extract_coords_from_geojson_coords(coords, out):
-    if isinstance(coords[0], (float, int)):
-        out.append((coords[1], coords[0]))
-    else:
-        for c in coords:
-            _extract_coords_from_geojson_coords(c, out)
-
-
-def _centroid_and_bbox_from_feature(feature):
-    coords = []
-    geom = feature.get("geometry", {})
-    if not geom:
-        return None, None
-    _extract_coords_from_geojson_coords(geom.get("coordinates", []), coords)
-    if not coords:
-        return None, None
-    lats = [c[0] for c in coords]
-    lons = [c[1] for c in coords]
-    centroid = [sum(lats) / len(lats), sum(lons) / len(lons)]
-    bbox = [min(lats), min(lons), max(lats), max(lons)]
-    return centroid, bbox
-
-
-def _state_feature_by_sigla(geojson_estados, sigla):
-    for feat in geojson_estados.get("features", []):
-        props = feat.get("properties", {})
-        if props.get("sigla") == sigla or props.get("UF") == sigla or props.get("ESTADO") == sigla:
-            return feat
-    for feat in geojson_estados.get("features", []):
-        props = feat.get("properties", {})
-        nome = props.get("nome") or props.get("NOME") or ""
-        if sigla in nome:
-            return feat
-    return None
-
-
-def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
+# -----------------------------
+# MAPA - PRINCIPAL (otimizado)
+# -----------------------------
+def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None, show_state_borders=True, use_fast_cluster=True):
+    """
+    Cria mapa folium otimizado:
+    - usa FastMarkerCluster quando há muitos marcadores (muito mais rápido)
+    - evita consultar geojson de cidade para cada linha (apenas pontos são desenhados)
+    - adiciona camadas de borda dos estados (pré-carregadas)
+    """
     default_location = [-14.2350, -51.9253]
     zoom_start = 5
     if zoom_to_state and isinstance(zoom_to_state, dict):
         center = zoom_to_state.get("center", default_location)
         zoom_start = zoom_to_state.get("zoom", 6)
-        mapa = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron")
+        mapa = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron", prefer_canvas=True)
     else:
-        mapa = folium.Map(location=default_location, zoom_start=zoom_start, tiles="CartoDB positron")
+        mapa = folium.Map(location=default_location, zoom_start=zoom_start, tiles="CartoDB positron", prefer_canvas=True)
 
-    for _, row in df.iterrows():
-        if filtro_distribuidores and row["Distribuidor"] not in filtro_distribuidores:
+    # Pre-filtrar distribuidores
+    if filtro_distribuidores:
+        df_iter = df[df["Distribuidor"].isin(filtro_distribuidores)]
+    else:
+        df_iter = df
+
+    # Preparar lista de pontos válidos (para cluster)
+    pontos = []
+    # também manter popup simples por ponto (para FastMarkerCluster não aceita popups diretamente)
+    popups = []
+
+    for _, row in df_iter.iterrows():
+        lat = row.get("Latitude", pd.NA)
+        lon = row.get("Longitude", pd.NA)
+        if pd.isna(lat) or pd.isna(lon):
             continue
-        cidade = row.get("Cidade", "")
-        estado = row.get("Estado", "")
-        geojson = None
         try:
-            if cidade and estado:
-                geojson = obter_geojson_cidade(cidade, estado)
+            latf = float(lat)
+            lonf = float(lon)
         except:
-            geojson = None
+            continue
+        if not (-35.0 <= latf <= 6.0 and -82.0 <= lonf <= -30.0):
+            continue
+        pontos.append([latf, lonf])
+        popup_html = f"<b>{row.get('Distribuidor')}</b><br/>{row.get('Cidade','')} - {row.get('Estado','')}<br/>{row.get('Contato','')}<br/>{row.get('Email','')}"
+        popups.append(popup_html)
 
-        cor = cor_distribuidor(row.get("Distribuidor", ""))
-        if geojson and "features" in geojson:
+    # Se muitos pontos, usar FastMarkerCluster (renderiza no lado do cliente com canvas)
+    if pontos:
+        try:
+            if use_fast_cluster and len(pontos) > 40:
+                # FastMarkerCluster aceita lista de [lat, lon]; ele é muito rápido
+                FastMarkerCluster(pontos).add_to(mapa)
+            else:
+                # MarkerCluster com CircleMarker (mais controlável)
+                mc = MarkerCluster()
+                for i, pt in enumerate(pontos):
+                    folium.CircleMarker(
+                        location=pt,
+                        radius=6,
+                        color="#333333",
+                        fill=True,
+                        fill_color=cor_distribuidor(popups[i] if i < len(popups) else ""),
+                        fill_opacity=0.8,
+                        popup=popups[i] if i < len(popups) else None,
+                    ).add_to(mc)
+                mc.add_to(mapa)
+        except Exception:
+            # fallback: desenhar círculos simples
+            for i, pt in enumerate(pontos):
+                folium.CircleMarker(
+                    location=pt,
+                    radius=5,
+                    color="#333333",
+                    fill=True,
+                    fill_color="#3388ff",
+                    fill_opacity=0.7,
+                    popup=popups[i] if i < len(popups) else None,
+                ).add_to(mapa)
+
+    # Adicionar bordas dos estados (camada leve)
+    if show_state_borders:
+        geo_estados = obter_geojson_estados()
+        if geo_estados:
             try:
                 folium.GeoJson(
-                    geojson,
-                    style_function=lambda feature, cor=cor: {
-                        "fillColor": cor,
-                        "color": "#666666",
-                        "weight": 1.2,
-                        "fillOpacity": 0.55,
-                    },
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
+                    geo_estados,
+                    name="Divisas Estaduais",
+                    style_function=lambda f: f.get("properties", {}).get("style", {
+                        "color": "#000000",
+                        "weight": 2,
+                        "fillOpacity": 0,
+                    }),
+                    tooltip=folium.GeoJsonTooltip(fields=["nome"], aliases=["Estado:"]),
                 ).add_to(mapa)
             except:
                 pass
-        else:
-            try:
-                lat = row.get("Latitude", pd.NA)
-                lon = row.get("Longitude", pd.NA)
-                if pd.isna(lat) or pd.isna(lon):
-                    continue
-                if not (-35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0):
-                    continue
-                folium.CircleMarker(
-                    location=[float(lat), float(lon)],
-                    radius=8,
-                    color="#333333",
-                    fill=True,
-                    fill_color=cor,
-                    fill_opacity=0.8,
-                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
-                ).add_to(mapa)
-            except:
-                continue
-
-    geo_estados = obter_geojson_estados()
-    if geo_estados:
-        try:
-            folium.GeoJson(
-                geo_estados,
-                name="Divisas Estaduais",
-                style_function=lambda f: f.get("properties", {}).get("style", {
-                    "color": "#000000",
-                    "weight": 3,
-                    "fillOpacity": 0,
-                }),
-                tooltip=folium.GeoJsonTooltip(fields=["nome"], aliases=["Estado:"]),
-            ).add_to(mapa)
-        except:
-            pass
 
     folium.LayerControl().add_to(mapa)
     return mapa
@@ -510,23 +517,37 @@ if choice == "Cadastro" and nivel_cookie == "editor":
             else:
                 novos = []
                 for c in cidades_sel:
-                    lat, lon = obter_coordenadas(c, estado_sel)
-                    try:
-                        if lat is None or lon is None or lat == "" or lon == "":
-                            lat_v, lon_v = pd.NA, pd.NA
-                        else:
-                            lat_v = float(str(lat).replace(",", "."))
-                            lon_v = float(str(lon).replace(",", "."))
-                            if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
+                    # Geocodificar SOMENTE quando necessário (planilha não tem coords)
+                    lat_v, lon_v = pd.NA, pd.NA
+                    # tentar buscar coords via tabela (caso exista alguma linha com mesma cidade/estado)
+                    match_mask = (
+                        (st.session_state.df["Cidade"].str.lower() == c.lower()) &
+                        (st.session_state.df["Estado"].str.upper() == estado_sel.upper())
+                    )
+                    if not st.session_state.df[match_mask].empty:
+                        row_match = st.session_state.df[match_mask].iloc[0]
+                        if not pd.isna(row_match["Latitude"]) and not pd.isna(row_match["Longitude"]):
+                            lat_v = row_match["Latitude"]
+                            lon_v = row_match["Longitude"]
+                    else:
+                        lat, lon = obter_coordenadas(c, estado_sel)
+                        try:
+                            if lat is None or lon is None or lat == "" or lon == "":
                                 lat_v, lon_v = pd.NA, pd.NA
-                    except:
-                        lat_v, lon_v = pd.NA, pd.NA
+                            else:
+                                lat_v = float(str(lat).replace(",", "."))
+                                lon_v = float(str(lon).replace(",", "."))
+                                if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
+                                    lat_v, lon_v = pd.NA, pd.NA
+                        except:
+                            lat_v, lon_v = pd.NA, pd.NA
                     novos.append([nome, contato, email, estado_sel, c, lat_v, lon_v])
                 novo_df = pd.DataFrame(novos, columns=COLUNAS)
                 st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
                 salvar_dados(st.session_state.df)
                 st.session_state.df = carregar_dados()
                 st.success(f"✅ Distribuidor '{nome}' adicionado!")
+
 
 # =============================
 # LISTA / EDITAR / EXCLUIR
@@ -573,17 +594,29 @@ elif choice == "Lista / Editar / Excluir":
                             st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_edit]
                             novos = []
                             for cidade in cidades_novas:
-                                lat, lon = obter_coordenadas(cidade, estado_edit)
-                                try:
-                                    if lat is None or lon is None or lat == "" or lon == "":
-                                        lat_v, lon_v = pd.NA, pd.NA
-                                    else:
-                                        lat_v = float(str(lat).replace(",", "."))
-                                        lon_v = float(str(lon).replace(",", "."))
-                                        if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
+                                lat_v, lon_v = pd.NA, pd.NA
+                                # tentar reaproveitar coords existentes para a mesma cidade/estado
+                                match_mask = (
+                                    (st.session_state.df["Cidade"].str.lower() == cidade.lower()) &
+                                    (st.session_state.df["Estado"].str.upper() == estado_edit.upper())
+                                )
+                                if not st.session_state.df[match_mask].empty:
+                                    row_match = st.session_state.df[match_mask].iloc[0]
+                                    if not pd.isna(row_match["Latitude"]) and not pd.isna(row_match["Longitude"]):
+                                        lat_v = row_match["Latitude"]
+                                        lon_v = row_match["Longitude"]
+                                else:
+                                    lat, lon = obter_coordenadas(cidade, estado_edit)
+                                    try:
+                                        if lat is None or lon is None or lat == "" or lon == "":
                                             lat_v, lon_v = pd.NA, pd.NA
-                                except:
-                                    lat_v, lon_v = pd.NA, pd.NA
+                                        else:
+                                            lat_v = float(str(lat).replace(",", "."))
+                                            lon_v = float(str(lon).replace(",", "."))
+                                            if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
+                                                lat_v, lon_v = pd.NA, pd.NA
+                                    except:
+                                        lat_v, lon_v = pd.NA, pd.NA
                                 novos.append([nome_edit, contato_edit, email_edit, estado_edit, cidade, lat_v, lon_v])
                             novo_df = pd.DataFrame(novos, columns=COLUNAS)
                             st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
@@ -599,6 +632,7 @@ elif choice == "Lista / Editar / Excluir":
                     salvar_dados(st.session_state.df)
                     st.session_state.df = carregar_dados()
                     st.success(f"🗑️ '{dist_del}' removido!")
+
 
 # =============================
 # MAPA (filtros na sidebar, com busca de cidade mostrando mensagens/tabela)
@@ -724,6 +758,14 @@ elif choice == "Mapa":
                 df_cidade_map = df_cidade_map[df_cidade_map["Distribuidor"].isin(
                     st.session_state.distribuidores_selecionados)]
 
+            # Se cidade selecionada, tentamos desenhar a malha municipal (apenas uma vez via cache)
+            geojson = None
+            try:
+                cidade_nome_simple = cidade_nome.strip()
+                geojson = obter_geojson_cidade(cidade_nome_simple, estado_sigla)
+            except Exception:
+                geojson = None
+
             # calcular zoom centrado em df_cidade_map (se tem coords válidas)
             zoom_to_state = None
             lats = pd.to_numeric(df_cidade_map["Latitude"], errors="coerce").dropna()
@@ -755,8 +797,27 @@ elif choice == "Mapa":
                 df_cidade_map,
                 filtro_distribuidores=(st.session_state.distribuidores_selecionados
                                        if st.session_state.distribuidores_selecionados else None),
-                zoom_to_state=zoom_to_state
+                zoom_to_state=zoom_to_state,
+                show_state_borders=True,
+                use_fast_cluster=True
             )
+
+            # se há geojson da cidade, adiciona em camadas separadas (apenas UMA vez)
+            if geojson:
+                try:
+                    folium.GeoJson(
+                        geojson,
+                        name=f"Malha: {cidade_nome} - {estado_sigla}",
+                        style_function=lambda feature: {
+                            "fillColor": "#ffff00",
+                            "color": "#666666",
+                            "weight": 1.0,
+                            "fillOpacity": 0.15,
+                        },
+                    ).add_to(mapa)
+                except:
+                    pass
+
             st_folium(mapa, width=1200, height=700)
     else:
         # Sem busca por cidade: aplicar filtros combinados e mostrar mapa geral
@@ -794,6 +855,8 @@ elif choice == "Mapa":
             df_filtro,
             filtro_distribuidores=(st.session_state.distribuidores_selecionados
                                    if st.session_state.distribuidores_selecionados else None),
-            zoom_to_state=zoom_to_state
+            zoom_to_state=zoom_to_state,
+            show_state_borders=True,
+            use_fast_cluster=True
         )
         st_folium(mapa, width=1200, height=700)

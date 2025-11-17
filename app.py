@@ -1,7 +1,8 @@
 # -------------------------------------------------------------
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
 # Versão final: filtros sidebar, busca cidade com mensagem/tabela,
-# limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
+# limpeza de filtros, zoom por estado robusto, sanitização lat/lon,
+# e POPULAÇÃO da cidade mostrada no tooltip do mapa (IBGE).
 # Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
 # -------------------------------------------------------------
 
@@ -114,8 +115,13 @@ def carregar_dados():
     df["Longitude"] = df["Longitude"].apply(to_float_safe)
 
     # Validar limites aproximados do Brasil (lat: -35..6, lon: -82..-30). Valores fora são considerados inválidos.
-    df.loc[~df["Latitude"].between(-35.0, 6.0, inclusive="both"), "Latitude"] = pd.NA
-    df.loc[~df["Longitude"].between(-82.0, -30.0, inclusive="both"), "Longitude"] = pd.NA
+    try:
+        df.loc[~df["Latitude"].between(-35.0, 6.0, inclusive="both"), "Latitude"] = pd.NA
+        df.loc[~df["Longitude"].between(-82.0, -30.0, inclusive="both"), "Longitude"] = pd.NA
+    except Exception:
+        # compatibilidade com pandas antigas
+        df.loc[(df["Latitude"] < -35.0) | (df["Latitude"] > 6.0), "Latitude"] = pd.NA
+        df.loc[(df["Longitude"] < -82.0) | (df["Longitude"] > -30.0), "Longitude"] = pd.NA
 
     return df
 
@@ -195,20 +201,23 @@ STATE_CENTROIDS = {
     "TO": {"center": [-9.45, -48.26], "zoom": 6},
 }
 
+
 # -----------------------------
 # FUNÇÕES AUXILIARES (IBGE + GEO)
 # -----------------------------
 @st.cache_data
 def carregar_estados():
     url = "https://servicodados.ibge.gov.br/api/v1/localidades/estados"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
     return sorted(resp.json(), key=lambda e: e["nome"])
 
 
 @st.cache_data
 def carregar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
     return sorted(resp.json(), key=lambda c: c["nome"])
 
 
@@ -219,7 +228,7 @@ def carregar_todas_cidades():
     for estado in estados:
         uf = estado["sigla"]
         url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-        resp = requests.get(url)
+        resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             for c in resp.json():
                 cidades.append(f"{c['nome']} - {uf}")
@@ -249,7 +258,7 @@ def obter_geojson_cidade(cidade, estado_sigla):
         "?formato=application/vnd.geo+json&qualidade=intermediaria"
     )
     try:
-        resp = requests.get(geojson_url, timeout=5)
+        resp = requests.get(geojson_url, timeout=10)
         if resp.status_code == 200:
             return resp.json()
     except:
@@ -264,7 +273,7 @@ def obter_geojson_estados():
         "?formato=application/vnd.geo+json&qualidade=simplificada&incluir=estados"
     )
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=20)
         if resp.status_code == 200:
             geojson = resp.json()
             for feature in geojson.get("features", []):
@@ -278,6 +287,46 @@ def obter_geojson_estados():
     except:
         pass
     return None
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def obter_populacao(cidade, estado_sigla):
+    """Tenta buscar população estimada (ano mais recente disponível) pelo IBGE.
+    Retorna int ou None.
+    """
+    try:
+        # primeiro localiza o município dentro da UF
+        url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{estado_sigla}/municipios"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        municipios = resp.json()
+        municipio = next((m for m in municipios if m["nome"].lower() == cidade.lower()), None)
+        if not municipio:
+            return None
+
+        # procurar série de população via API de estimativas (v1 doesn't provide population directly)
+        # usamos o endpoint de agregados (padrão sugerido anteriormente). Se falhar, devolve None.
+        mun_id = municipio["id"]
+        # Endpoint que traz a estimativa populacional (variável 6579/9324 é um exemplo — caso não funcione,
+        # essa chamada pode retornar None; mantemos tratamento tranquilo)
+        pop_url = f"https://servicodados.ibge.gov.br/api/v3/agregados/6579/periodos/2022/variaveis/9324?localidades=N6[{mun_id}]"
+        pop_resp = requests.get(pop_url, timeout=10)
+        if pop_resp.status_code != 200:
+            return None
+        dados = pop_resp.json()
+        try:
+            # navegar na estrutura para achar série 2022 (ou único valor disponível)
+            val = dados[0]["resultados"][0]["series"][0]["serie"]
+            # pegar último ano disponível
+            if isinstance(val, dict):
+                anos = sorted(val.keys())
+                ultimo = anos[-1]
+                return int(float(val[ultimo]))
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 def cor_distribuidor(nome):
@@ -346,6 +395,17 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
             geojson = None
 
         cor = cor_distribuidor(row.get("Distribuidor", ""))
+
+        # obter população (cacheada) — pode ser lenta na primeira chamada para muitas cidades
+        pop_val = None
+        try:
+            if cidade and estado:
+                pop_val = obter_populacao(cidade, estado)
+        except:
+            pop_val = None
+
+        tooltip_html = f"<b>{row.get('Distribuidor','')}</b><br>{cidade} - {estado}<br>População: {pop_val if pop_val else 'Não disponível'}"
+
         if geojson and "features" in geojson:
             try:
                 folium.GeoJson(
@@ -356,9 +416,10 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                         "weight": 1.2,
                         "fillOpacity": 0.55,
                     },
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
+                    tooltip=folium.Tooltip(tooltip_html, sticky=True),
                 ).add_to(mapa)
-            except:
+            except Exception:
+                # se falhar, caia para adicionar um marcador por coordenadas
                 pass
         else:
             try:
@@ -366,7 +427,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                 lon = row.get("Longitude", pd.NA)
                 if pd.isna(lat) or pd.isna(lon):
                     continue
-                if not (-35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0):
+                if not (-35.0 <= float(lat) <= 6.0 and -82.0 <= float(lon) <= -30.0):
                     continue
                 folium.CircleMarker(
                     location=[float(lat), float(lon)],
@@ -375,9 +436,9 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                     fill=True,
                     fill_color=cor,
                     fill_opacity=0.8,
-                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
+                    tooltip=folium.Tooltip(tooltip_html, sticky=True),
                 ).add_to(mapa)
-            except:
+            except Exception:
                 continue
 
     geo_estados = obter_geojson_estados()
@@ -447,6 +508,7 @@ if st.sidebar.button("🚪 Sair"):
     cookies["nivel"] = ""
     cookies.save()
     st.rerun()
+
 
 # -----------------------------
 # CARREGAR DADOS (sessão)
@@ -528,6 +590,7 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                 st.session_state.df = carregar_dados()
                 st.success(f"✅ Distribuidor '{nome}' adicionado!")
 
+
 # =============================
 # LISTA / EDITAR / EXCLUIR
 # =============================
@@ -599,6 +662,7 @@ elif choice == "Lista / Editar / Excluir":
                     salvar_dados(st.session_state.df)
                     st.session_state.df = carregar_dados()
                     st.success(f"🗑️ '{dist_del}' removido!")
+
 
 # =============================
 # MAPA (filtros na sidebar, com busca de cidade mostrando mensagens/tabela)

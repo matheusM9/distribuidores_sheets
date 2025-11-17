@@ -2,7 +2,6 @@
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
 # Versão final: filtros sidebar, busca cidade com mensagem/tabela,
 # limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
-# Inclui população da cidade no tooltip ao passar o mouse.
 # Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
 # -------------------------------------------------------------
 
@@ -281,46 +280,6 @@ def obter_geojson_estados():
     return None
 
 
-@st.cache_data(ttl=60 * 60 * 24)
-def obter_populacao(cidade, estado_sigla):
-    """Tenta obter a população estimada (IBGE) para a cidade.
-    Retorna um inteiro de população ou None se não disponível.
-    """
-    try:
-        cidades_data = carregar_cidades(estado_sigla)
-        cidade_info = next((c for c in cidades_data if c["nome"] == cidade), None)
-        if not cidade_info:
-            return None
-        city_id = cidade_info.get("id")
-        if not city_id:
-            return None
-        url = f"https://servicodados.ibge.gov.br/api/v1/projecoes/populacao/municipios/{city_id}"
-        resp = requests.get(url, timeout=6)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        # Tentar diferentes estruturas:
-        # {"projecao": {"populacao": 12345, "ano": 2023}} ou {"projecao": 12345} ou {'valor':12345}
-        if isinstance(data, dict):
-            if "projecao" in data:
-                proj = data["projecao"]
-                if isinstance(proj, dict):
-                    return int(proj.get("populacao") or proj.get("valor") or 0) or None
-                else:
-                    try:
-                        return int(proj)
-                    except:
-                        return None
-            if "valor" in data:
-                try:
-                    return int(data["valor"])
-                except:
-                    return None
-        return None
-    except Exception:
-        return None
-
-
 def cor_distribuidor(nome):
     h = abs(hash(nome)) % 0xAAAAAA
     h += 0x111111
@@ -387,17 +346,6 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
             geojson = None
 
         cor = cor_distribuidor(row.get("Distribuidor", ""))
-
-        # Tentar obter população (cacheada) para mostrar no tooltip/popup
-        pop = None
-        try:
-            if cidade and estado:
-                pop = obter_populacao(cidade, estado)
-        except:
-            pop = None
-
-        pop_text = f" — População: {pop:,}" if (pop is not None and isinstance(pop, int)) else ""
-
         if geojson and "features" in geojson:
             try:
                 folium.GeoJson(
@@ -408,7 +356,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                         "weight": 1.2,
                         "fillOpacity": 0.55,
                     },
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado}){pop_text}",
+                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
                 ).add_to(mapa)
             except:
                 pass
@@ -427,8 +375,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                     fill=True,
                     fill_color=cor,
                     fill_opacity=0.8,
-                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado}){pop_text}",
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado}){pop_text}",
+                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
                 ).add_to(mapa)
             except:
                 continue
@@ -595,7 +542,7 @@ elif choice == "Lista / Editar / Excluir":
                 dist_edit = st.selectbox("Distribuidor", st.session_state.df["Distribuidor"].unique())
                 dados = st.session_state.df[st.session_state.df["Distribuidor"] == dist_edit]
                 nome_edit = st.text_input("Nome", value=dist_edit)
-                contato_edit = st.text_input("Contato", value=dados.iloc[0]["Contato"]) 
+                contato_edit = st.text_input("Contato", value=dados.iloc[0]["Contato"])
                 email_edit = st.text_input("Email", value=dados.iloc[0]["Email"])
                 estado_edit = st.selectbox(
                     "Estado",
@@ -850,5 +797,3 @@ elif choice == "Mapa":
             zoom_to_state=zoom_to_state
         )
         st_folium(mapa, width=1200, height=700)
-
-# EOF

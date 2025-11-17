@@ -2,7 +2,6 @@
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
 # Versão final: filtros sidebar, busca cidade com mensagem/tabela,
 # limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
-# Agora com coluna de População municipal (busca via IBGE quando possível)
 # Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
 # -------------------------------------------------------------
 
@@ -32,8 +31,7 @@ st.set_page_config(page_title="Distribuidores", layout="wide")
 # -----------------------------
 SHEET_ID = "1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k"
 SHEET_NAME = "Página1"
-# ADD: coluna Populacao
-COLUNAS = ["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Latitude", "Longitude", "Populacao"]
+COLUNAS = ["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Latitude", "Longitude"]
 
 # -----------------------------
 # Inicializar Google Sheets client
@@ -73,7 +71,7 @@ init_gsheets()
 # -----------------------------
 @st.cache_data(ttl=300)
 def carregar_dados():
-    """Busca dados do Google Sheets, garante colunas e sanitiza lat/lon e populacao."""
+    """Busca dados do Google Sheets, garante colunas e sanitiza lat/lon."""
     try:
         records = WORKSHEET.get_all_records()
     except Exception as e:
@@ -118,28 +116,6 @@ def carregar_dados():
     # Validar limites aproximados do Brasil (lat: -35..6, lon: -82..-30). Valores fora são considerados inválidos.
     df.loc[~df["Latitude"].between(-35.0, 6.0, inclusive="both"), "Latitude"] = pd.NA
     df.loc[~df["Longitude"].between(-82.0, -30.0, inclusive="both"), "Longitude"] = pd.NA
-
-    # Normalizar Populacao: tentar converter para int, deixar NaN se inválido
-    def to_int_safe(x):
-        if x is None:
-            return pd.NA
-        if isinstance(x, (int, float)) and not pd.isna(x):
-            try:
-                return int(x)
-            except:
-                return pd.NA
-        s = str(x).strip()
-        if s == "":
-            return pd.NA
-        s = re.sub(r"[^0-9]", "", s)
-        if s == "":
-            return pd.NA
-        try:
-            return int(s)
-        except:
-            return pd.NA
-
-    df["Populacao"] = df["Populacao"].apply(to_int_safe)
 
     return df
 
@@ -219,7 +195,6 @@ STATE_CENTROIDS = {
     "TO": {"center": [-9.45, -48.26], "zoom": 6},
 }
 
-
 # -----------------------------
 # FUNÇÕES AUXILIARES (IBGE + GEO)
 # -----------------------------
@@ -227,14 +202,14 @@ STATE_CENTROIDS = {
 def carregar_estados():
     url = "https://servicodados.ibge.gov.br/api/v1/localidades/estados"
     resp = requests.get(url)
-    return sorted(resp.json(), key=lambda e: e["nome"]) if resp.status_code == 200 else []
+    return sorted(resp.json(), key=lambda e: e["nome"])
 
 
 @st.cache_data
 def carregar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
     resp = requests.get(url)
-    return sorted(resp.json(), key=lambda c: c["nome"]) if resp.status_code == 200 else []
+    return sorted(resp.json(), key=lambda c: c["nome"])
 
 
 @st.cache_data
@@ -305,82 +280,6 @@ def obter_geojson_estados():
     return None
 
 
-@st.cache_data
-def obter_populacao_ibge_por_municipio(cidade, estado_sigla):
-    """
-    Tenta obter estimativa de população do IBGE para o município.
-    Estratégia:
-      1) Busca o ID do município via /localidades/estados/{UF}/municipios
-      2) Tenta endpoints conhecidos (a API do IBGE tem várias versões) — fazemos tentativas
-    Retorna int (população) ou None.
-
-    Observação: endpoints do IBGE podem mudar; este método tenta ser resiliente e retornar None
-    se não encontrar o valor. Se você precisar de maior precisão/versões históricas, recomendo
-    baixar a base de "Estimativas de população" do IBGE ou usar o endpoint v3 de agregados.
-    """
-    try:
-        cidades_data = carregar_cidades(estado_sigla)
-        cidade_info = next((c for c in cidades_data if c["nome"].lower() == cidade.lower()), None)
-        if not cidade_info:
-            return None
-        mid = cidade_info["id"]
-        # Tentativa 1: endpoint de projeções/estimativas (não documentado consistentemente para todos)
-        try_urls = [
-            f"https://servicodados.ibge.gov.br/api/v1/projecoes/populacao/municipios/{mid}",
-            f"https://servicodados.ibge.gov.br/api/v1/projecoes/populacao/municipios/{mid}?localidade=municipio",
-        ]
-        for url in try_urls:
-            try:
-                r = requests.get(url, timeout=6)
-                if r.status_code == 200:
-                    j = r.json()
-                    # possibilmente retorna {'populacao': 12345} ou similar
-                    if isinstance(j, dict):
-                        # procurar por qualquer valor numérico no json
-                        for v in j.values():
-                            if isinstance(v, (int, float)):
-                                return int(v)
-                            if isinstance(v, dict):
-                                for vv in v.values():
-                                    if isinstance(vv, (int, float)):
-                                        return int(vv)
-            except:
-                pass
-
-        # Tentativa 2: endpoint de agregados v3 (mais verboso) — exemplo de uso genérico
-        # NOTE: a consulta abaixo pode falhar dependendo das versões do IBGE; tentamos e aceitamos None
-        agg_url = f"https://servicodados.ibge.gov.br/api/v3/agregados/6579/periodos/2022/variaveis/9324?localidades=N3[{mid}]"
-        try:
-            r = requests.get(agg_url, timeout=6)
-            if r.status_code == 200:
-                j = r.json()
-                # estrutura complexa — tentamos extrair o primeiro valor numérico encontrado
-                def deep_find_number(obj):
-                    if isinstance(obj, (int, float)):
-                        return int(obj)
-                    if isinstance(obj, dict):
-                        for k in obj:
-                            res = deep_find_number(obj[k])
-                            if res is not None:
-                                return res
-                    if isinstance(obj, list):
-                        for item in obj:
-                            res = deep_find_number(item)
-                            if res is not None:
-                                return res
-                    return None
-
-                found = deep_find_number(j)
-                if found is not None:
-                    return int(found)
-        except:
-            pass
-
-    except Exception:
-        pass
-    return None
-
-
 def cor_distribuidor(nome):
     h = abs(hash(nome)) % 0xAAAAAA
     h += 0x111111
@@ -447,9 +346,6 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
             geojson = None
 
         cor = cor_distribuidor(row.get("Distribuidor", ""))
-        pop = row.get("Populacao", None)
-        pop_label = f"\nPopulação: {int(pop):,}" if (pd.notna(pop) and pop is not None) else "\nPopulação: N/A"
-
         if geojson and "features" in geojson:
             try:
                 folium.GeoJson(
@@ -460,7 +356,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                         "weight": 1.2,
                         "fillOpacity": 0.55,
                     },
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado}){pop_label}",
+                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
                 ).add_to(mapa)
             except:
                 pass
@@ -479,7 +375,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                     fill=True,
                     fill_color=cor,
                     fill_opacity=0.8,
-                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado}){pop_label}",
+                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
                 ).add_to(mapa)
             except:
                 continue
@@ -605,7 +501,6 @@ if choice == "Cadastro" and nivel_cookie == "editor":
             for c in cidades_sel:
                 if c in st.session_state.df["Cidade"].tolist() and not cidade_eh_capital(c, estado_sel):
                     dist_existente = st.session_state.df.loc[st.session_state.df["Cidade"] == c, "Distribuidor"].iloc[0]
-                    cidades_ocupada.append = None
                     cidades_ocupadas.append(f"{c} (atualmente atribuída a {dist_existente})")
             if cidades_ocupadas:
                 st.error(
@@ -626,9 +521,7 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                                 lat_v, lon_v = pd.NA, pd.NA
                     except:
                         lat_v, lon_v = pd.NA, pd.NA
-
-                    pop = obter_populacao_ibge_por_municipio(c, estado_sel)
-                    novos.append([nome, contato, email, estado_sel, c, lat_v, lon_v, pop if pop is not None else ""])
+                    novos.append([nome, contato, email, estado_sel, c, lat_v, lon_v])
                 novo_df = pd.DataFrame(novos, columns=COLUNAS)
                 st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
                 salvar_dados(st.session_state.df)
@@ -640,7 +533,7 @@ if choice == "Cadastro" and nivel_cookie == "editor":
 # =============================
 elif choice == "Lista / Editar / Excluir":
     st.subheader("Distribuidores Cadastrados")
-    st.dataframe(st.session_state.df[["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Populacao"]],
+    st.dataframe(st.session_state.df[["Distribuidor", "Contato", "Email", "Estado", "Cidade"]],
                  use_container_width=True)
 
     if nivel_cookie == "editor":
@@ -691,9 +584,7 @@ elif choice == "Lista / Editar / Excluir":
                                             lat_v, lon_v = pd.NA, pd.NA
                                 except:
                                     lat_v, lon_v = pd.NA, pd.NA
-
-                                pop = obter_populacao_ibge_por_municipio(cidade, estado_edit)
-                                novos.append([nome_edit, contato_edit, email_edit, estado_edit, cidade, lat_v, lon_v, pop if pop is not None else ""])
+                                novos.append([nome_edit, contato_edit, email_edit, estado_edit, cidade, lat_v, lon_v])
                             novo_df = pd.DataFrame(novos, columns=COLUNAS)
                             st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
                             salvar_dados(st.session_state.df)
@@ -823,8 +714,8 @@ elif choice == "Mapa":
             st_folium(mapa, width=1200, height=700)
         else:
             st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{st.session_state.cidade_busca}**:")
-            # Mostrar tabela com Distribuidor, Contato, Email e Populacao
-            st.dataframe(df_cidade[["Distribuidor", "Contato", "Email", "Populacao"]].reset_index(drop=True),
+            # Mostrar tabela com Distribuidor, Contato, Email
+            st.dataframe(df_cidade[["Distribuidor", "Contato", "Email"]].reset_index(drop=True),
                          use_container_width=True)
 
             # Criar mapa apenas com df_cidade (aplica filtro de distribuidores caso tenham sido selecionados)
@@ -906,13 +797,3 @@ elif choice == "Mapa":
             zoom_to_state=zoom_to_state
         )
         st_folium(mapa, width=1200, height=700)
-
-# FIM do app.py
-# Observações:
-# - A função obter_populacao_ibge_por_municipio tenta acessar endpoints do IBGE para populacao municipal.
-#   A API do IBGE possui várias versões e formatos; em alguns casos será necessário ajustar o endpoint
-#   (por exemplo, usar o endpoint v3 de agregados com parâmetros corretos) ou manter uma tabela local
-#   de populacao (p.ex. base dos dados ou XLS do IBGE) para garantir consistência.
-# - Para performance, resultados de estado/cidades e da função de populacao são cacheados via st.cache_data.
-# - Se quiser, eu adapto para: (1) buscar a populacao de todos os municípios em lote via um arquivo CSV/ODS
-#   do IBGE ou "basedosdados"; ou (2) usar um endpoint alternativo (BrasilAPI/back4app) e armazenar em cache.

@@ -356,8 +356,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                         "weight": 1.2,
                         "fillOpacity": 0.55,
                     },
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado}) - População: {obter_populacao(cidade, estado) or 'Não disponível'}",
-
+                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
                 ).add_to(mapa)
             except:
                 pass

@@ -22,6 +22,37 @@ def carregar_cidades(uf):
     resp = requests.get(url)
     return sorted(resp.json(), key=lambda c: c['nome'])
 
+@st.cache_data
+def obter_populacao(cidade, estado_sigla):
+    """Retorna a população oficial da cidade usando a API do IBGE."""
+    try:
+        # Descobrir ID da cidade via API
+        url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{estado_sigla}/municipios"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code != 200:
+            return None
+
+        dados = resp.json()
+        cidade_info = next((c for c in dados if c["nome"].lower() == cidade.lower()), None)
+        if not cidade_info:
+            return None
+
+        cidade_id = cidade_info["id"]
+
+        # Buscar população
+        pop_url = f"https://servicodados.ibge.gov.br/api/v1/projecoes/populacao/{cidade_id}"
+        pop_resp = requests.get(pop_url, timeout=5)
+
+        if pop_resp.status_code != 200:
+            return None
+
+        pop_json = pop_resp.json()
+
+        return pop_json.get("projecao", {}).get("populacao")
+    except:
+        return None
+
+
 # -----------------------------
 # Carregar CSV
 # -----------------------------

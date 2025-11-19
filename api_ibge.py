@@ -23,35 +23,6 @@ def carregar_cidades(uf):
     return sorted(resp.json(), key=lambda c: c['nome'])
 
 
-# 🔥 NOVO: buscar população IBGE
-@st.cache_data
-def obter_populacao(cidade, estado_sigla):
-    try:
-        # lista cidades do estado
-        url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{estado_sigla}/municipios"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code != 200:
-            return None
-
-        cidades = resp.json()
-        c_info = next((c for c in cidades if c["nome"].lower() == cidade.lower()), None)
-        if not c_info:
-            return None
-
-        cidade_id = c_info["id"]
-
-        # busca população
-        pop_url = f"https://servicodados.ibge.gov.br/api/v1/projecoes/populacao/{cidade_id}"
-        pop_resp = requests.get(pop_url, timeout=5)
-        if pop_resp.status_code != 200:
-            return None
-
-        pop_json = pop_resp.json()
-        return pop_json.get("projecao", {}).get("populacao")
-
-    except:
-        return None
-
 
 # -----------------------------
 # Carregar CSV
@@ -98,29 +69,20 @@ def criar_mapa(df):
     for _, row in df_valid.iterrows():
         lat = float(row["Latitude"])
         lon = float(row["Longitude"])
-        cidade = row["Cidade"]
-        estado = row["Estado"]
-
-        # população
-        pop = obter_populacao(cidade, estado) or "Não disponível"
-
-        # tooltip final
-        tooltip_text = f"{row['Distribuidor']} ({cidade} - {estado}) - População: {pop}"
-
         folium.CircleMarker(
             location=[lat, lon],
             radius=6,
             color=cor_distribuidor(row["Distribuidor"]),
             fill=True,
             fill_color=cor_distribuidor(row["Distribuidor"]),
-            popup=tooltip_text
+            popup=f"{row['Distribuidor']} ({row['Cidade']})"
         ).add_to(mapa)
 
     mapa.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
     return mapa
 
 # -----------------------------
-# Atualiza mapa
+# Função que atualiza mapa imediatamente
 # -----------------------------
 def atualizar_mapa():
     mapa = criar_mapa(st.session_state.df)
@@ -132,4 +94,87 @@ def atualizar_mapa():
 st.title("Sistema de Distribuidores Seguro")
 tab1, tab2, tab3 = st.tabs(["Cadastro", "Lista / Editar", "Mapa"])
 
-# Aba 1 etc...
+# --- Aba 1: Cadastro ---
+with tab1:
+    st.subheader("Cadastrar Novo Distribuidor")
+    estados = carregar_estados()
+    siglas = [e["sigla"] for e in estados]
+    estado_selecionado = st.selectbox("Selecione o Estado", siglas)
+
+    cidades = []
+    if estado_selecionado:
+        cidades_data = carregar_cidades(estado_selecionado)
+        cidades = [c["nome"] for c in cidades_data]
+    cidade_selecionada = st.selectbox("Selecione a Cidade", cidades)
+
+    with st.form("novo_distribuidor"):
+        nome = st.text_input("Nome do Distribuidor")
+        contato = st.text_input("Contato")
+        submitted = st.form_submit_button("Adicionar")
+        if submitted:
+            if not nome.strip() or not contato.strip() or not estado_selecionado or not cidade_selecionada:
+                st.error("Preencha todos os campos!")
+            else:
+                geolocator = Nominatim(user_agent="distribuidores_app")
+                location = geolocator.geocode(f"{cidade_selecionada}, {estado_selecionado}, Brasil")
+                latitude = location.latitude if location else ""
+                longitude = location.longitude if location else ""
+                novo = pd.DataFrame([[nome.strip(), contato.strip(), estado_selecionado, cidade_selecionada, latitude, longitude]],
+                                    columns=["Distribuidor", "Contato", "Estado", "Cidade", "Latitude", "Longitude"])
+                st.session_state.df = pd.concat([st.session_state.df, novo], ignore_index=True)
+                st.session_state.df.to_csv(DATA_FILE, index=False)
+                st.success(f"Distribuidor {nome} adicionado!")
+
+# --- Aba 2: Lista / Editar / Excluir ---
+with tab2:
+    st.subheader("Distribuidores Cadastrados")
+    st.dataframe(st.session_state.df.drop(columns=["Latitude", "Longitude"]))
+
+    st.markdown("---")
+    st.subheader("Editar Distribuidor")
+    if not st.session_state.df.empty:
+        dist_para_editar = st.selectbox("Selecione distribuidor para editar", st.session_state.df["Distribuidor"].tolist())
+        row = st.session_state.df[st.session_state.df["Distribuidor"] == dist_para_editar].iloc[0]
+
+        nome_edit = st.text_input("Nome", value=row["Distribuidor"])
+        contato_edit = st.text_input("Contato", value=row["Contato"])
+        estado_edit = st.selectbox("Estado", siglas, index=siglas.index(row["Estado"]) if row["Estado"] in siglas else 0)
+
+        cidades_edit = []
+        try:
+            cidades_data = carregar_cidades(estado_edit)
+            cidades_edit = [c["nome"] for c in cidades_data]
+        except:
+            pass
+        cidade_edit = st.selectbox("Cidade", cidades_edit, index=cidades_edit.index(row["Cidade"]) if row["Cidade"] in cidades_edit else 0)
+
+        if st.button("Salvar Alterações"):
+            if not nome_edit.strip() or not contato_edit.strip() or not estado_edit or not cidade_edit:
+                st.error("Preencha todos os campos!")
+            else:
+                latitude, longitude = row["Latitude"], row["Longitude"]
+                if latitude == "" or longitude == "":
+                    geolocator = Nominatim(user_agent="distribuidores_app")
+                    location = geolocator.geocode(f"{cidade_edit}, {estado_edit}, Brasil")
+                    latitude = location.latitude if location else ""
+                    longitude = location.longitude if location else ""
+                st.session_state.df.loc[
+                    st.session_state.df["Distribuidor"] == dist_para_editar,
+                    ["Distribuidor", "Contato", "Estado", "Cidade", "Latitude", "Longitude"]
+                ] = [nome_edit.strip(), contato_edit.strip(), estado_edit, cidade_edit, latitude, longitude]
+                st.session_state.df.to_csv(DATA_FILE, index=False)
+                st.success(f"Distribuidor {nome_edit} atualizado!")
+
+    st.markdown("---")
+    st.subheader("Excluir Distribuidor")
+    if not st.session_state.df.empty:
+        dist_para_excluir = st.selectbox("Selecione distribuidor para excluir", st.session_state.df["Distribuidor"].tolist())
+        if st.button("Excluir Distribuidor"):
+            st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_para_excluir]
+            st.session_state.df.to_csv(DATA_FILE, index=False)
+            st.success(f"Distribuidor {dist_para_excluir} excluído!")
+
+# --- Aba 3: Mapa ---
+with tab3:
+    st.subheader("Mapa de Distribuidores")
+    atualizar_mapa()  # chama a função que sempre renderiza o mapa

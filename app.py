@@ -227,54 +227,16 @@ def carregar_todas_cidades():
     return sorted(cidades)
 
 
-# -----------------------------
-# NOVA: OBTER POPULAÇÃO (IBGE - CENSO 2022)
-# -----------------------------
-@st.cache_data(ttl=60 * 60 * 24)  # cache por 1 dia
-def obter_populacao(cidade, uf):
-    """
-    Obtém a população do município usando o Censo 2022 do IBGE.
-    Retorna string formatada (ex: '1.234.567') ou 'Indisponível'.
-    """
+def obter_coordenadas(cidade, estado):
+    geolocator = Nominatim(user_agent="distribuidores_app", timeout=5)
     try:
-        if not cidade or not uf:
-            return "Indisponível"
-
-        # 1) buscar lista de municípios do estado
-        url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-        resp = requests.get(url, timeout=6)
-        if resp.status_code != 200:
-            return "Indisponível"
-        municipios = resp.json()
-
-        # 2) localizar município pelo nome (case-insensitive)
-        cid = next((m for m in municipios if m["nome"].strip().lower() == cidade.strip().lower()), None)
-        if not cid:
-            return "Indisponível"
-        cod = cid.get("id")
-        if not cod:
-            return "Indisponível"
-
-        # 3) buscar população via Censo 2022
-        url_pop = f"https://servicodados.ibge.gov.br/api/v1/censos/2022/pessoas?municipio={cod}"
-        resp_pop = requests.get(url_pop, timeout=6)
-        if resp_pop.status_code != 200:
-            return "Indisponível"
-        dados = resp_pop.json()
-        if not isinstance(dados, list) or len(dados) == 0:
-            return "Indisponível"
-        populacao = dados[0].get("quantidade")
-        if populacao is None:
-            return "Indisponível"
-
-        # formatar com separador de milhares no estilo BR
-        try:
-            return f"{int(populacao):n}".replace(",", ".")
-        except:
-            return str(populacao)
-
-    except Exception:
-        return "Indisponível"
+        location = geolocator.geocode(f"{cidade}, {estado}, Brasil")
+        if location:
+            return location.latitude, location.longitude
+        else:
+            return "", ""
+    except (GeocoderTimedOut, GeocoderUnavailable):
+        return "", ""
 
 
 @st.cache_data
@@ -385,16 +347,8 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
             geojson = None
 
         cor = cor_distribuidor(row.get("Distribuidor", ""))
-
-        # obter população (formatada ou "Indisponível")
-        pop = obter_populacao(cidade, estado) if (cidade and estado) else "Indisponível"
-
         if geojson and "features" in geojson:
             try:
-                tooltip_text = (
-                    f"{row.get('Distribuidor','')} — {cidade} - {estado}\n"
-                    f"População: {pop}"
-                )
                 folium.GeoJson(
                     geojson,
                     style_function=lambda feature, cor=cor: {
@@ -403,7 +357,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                         "weight": 1.2,
                         "fillOpacity": 0.55,
                     },
-                    tooltip=tooltip_text,
+                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
                 ).add_to(mapa)
             except:
                 pass
@@ -415,11 +369,6 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                     continue
                 if not (-35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0):
                     continue
-                popup_html = (
-                    f"<b>{row.get('Distribuidor','')}</b><br>"
-                    f"Cidade: {cidade} - {estado}<br>"
-                    f"População: {pop}"
-                )
                 folium.CircleMarker(
                     location=[float(lat), float(lon)],
                     radius=8,
@@ -427,7 +376,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                     fill=True,
                     fill_color=cor,
                     fill_opacity=0.8,
-                    popup=folium.Popup(popup_html, max_width=300),
+                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
                 ).add_to(mapa)
             except:
                 continue

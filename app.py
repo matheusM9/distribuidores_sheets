@@ -323,6 +323,69 @@ def _state_feature_by_sigla(geojson_estados, sigla):
     return None
 
 
+# -----------------------------
+# NOVA FUNÇÃO: OBTER POPULAÇÃO (IBGE)
+# -----------------------------
+@st.cache_data(ttl=60 * 60 * 24)  # cache por 1 dia
+def obter_populacao(cidade, uf):
+    """
+    Busca a população estimada da cidade usando a API do IBGE (projeções).
+    Retorna int (população) ou string em caso de erro/indisponibilidade.
+    """
+    try:
+        if not cidade or not uf:
+            return "Indisponível"
+        # buscar id do município na lista de municípios do estado
+        url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
+        resp = requests.get(url, timeout=6)
+        if resp.status_code != 200:
+            return "Indisponível"
+        municipios = resp.json()
+        cidade_info = next((m for m in municipios if m["nome"].lower() == cidade.lower()), None)
+        if not cidade_info:
+            return "Não encontrada"
+        cod = cidade_info.get("id")
+        if not cod:
+            return "Indisponível"
+
+        # chamar API de projeções/população
+        url_pop = f"https://servicodados.ibge.gov.br/api/v1/projecoes/populacao/{cod}"
+        resp_pop = requests.get(url_pop, timeout=6)
+        if resp_pop.status_code != 200:
+            return "Indisponível"
+        dados = resp_pop.json()
+        # Estrutura esperada: {"projecao": {"populacao": 12345, "ano": 2024}}
+        proj = dados.get("projecao") or {}
+        pop = proj.get("populacao")
+        if isinstance(pop, (int, float)):
+            return int(pop)
+        # fallback: se veio string numérica
+        try:
+            return int(str(pop))
+        except:
+            return "Indisponível"
+    except:
+        return "Indisponível"
+
+
+def formatar_populacao(pop):
+    """Formata a população: se numérica, retorna com separador de milhares '.' (estilo BR)."""
+    try:
+        if isinstance(pop, (int, float)):
+            return f"{int(pop):n}".replace(",", ".")
+        # se for string que representa número
+        s = str(pop)
+        s_clean = re.sub(r"[^\d]", "", s)
+        if s_clean == "":
+            return s
+        return f"{int(s_clean):n}".replace(",", ".")
+    except:
+        return str(pop)
+
+
+# -----------------------------
+# CRIAR MAPA
+# -----------------------------
 def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
     default_location = [-14.2350, -51.9253]
     zoom_start = 5
@@ -346,8 +409,18 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
             geojson = None
 
         cor = cor_distribuidor(row.get("Distribuidor", ""))
+
+        # obter população (pode ser int ou string de erro)
+        pop = obter_populacao(cidade, estado) if (cidade and estado) else "Indisponível"
+        pop_format = formatar_populacao(pop)
+
         if geojson and "features" in geojson:
             try:
+                # tooltip simples com distribuidor / cidade / estado / população
+                tooltip_text = (
+                    f"{row.get('Distribuidor','')} — {cidade} - {estado}\n"
+                    f"População: {pop_format}"
+                )
                 folium.GeoJson(
                     geojson,
                     style_function=lambda feature, cor=cor: {
@@ -356,7 +429,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                         "weight": 1.2,
                         "fillOpacity": 0.55,
                     },
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
+                    tooltip=tooltip_text,
                 ).add_to(mapa)
             except:
                 pass
@@ -368,6 +441,11 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                     continue
                 if not (-35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0):
                     continue
+                popup_html = (
+                    f"<b>{row.get('Distribuidor','')}</b><br>"
+                    f"Cidade: {cidade} - {estado}<br>"
+                    f"População: {pop_format}"
+                )
                 folium.CircleMarker(
                     location=[float(lat), float(lon)],
                     radius=8,
@@ -375,7 +453,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                     fill=True,
                     fill_color=cor,
                     fill_opacity=0.8,
-                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
+                    popup=folium.Popup(popup_html, max_width=300),
                 ).add_to(mapa)
             except:
                 continue

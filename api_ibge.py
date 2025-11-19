@@ -23,7 +23,6 @@ def carregar_cidades(uf):
     return sorted(resp.json(), key=lambda c: c['nome'])
 
 
-
 # -----------------------------
 # Carregar CSV
 # -----------------------------

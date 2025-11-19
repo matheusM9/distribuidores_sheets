@@ -247,7 +247,7 @@ def obter_geojson_cidade(cidade, estado_sigla):
         return None
     geojson_url = (
         f"https://servicodados.ibge.gov.br/api/v2/malhas/{cidade_info['id']}"
-        "?formato=application/vnd.geo+json&qualidade=intermediaria"
+        "?formato=application/vnd.geo+json&qualidade=simplificada"
     )
     try:
         resp = requests.get(geojson_url, timeout=5)

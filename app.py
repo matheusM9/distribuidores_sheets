@@ -36,7 +36,6 @@ SCOPE = [
 GC = None
 WORKSHEET = None
 
-
 def init_gsheets():
     global GC, WORKSHEET
     if "gcp_service_account" not in st.secrets:
@@ -55,7 +54,6 @@ def init_gsheets():
     except (DefaultCredentialsError, RefreshError, Exception) as e:
         st.error("Erro ao autenticar Google Sheets. Verifique o Secret da Service Account.\n" + str(e))
         st.stop()
-
 
 init_gsheets()
 
@@ -85,7 +83,6 @@ def carregar_dados():
             df[col] = ""
     return df[COLUNAS]
 
-
 def salvar_dados(df):
     try:
         df2 = df.copy()
@@ -100,7 +97,6 @@ def salvar_dados(df):
 
     except Exception as e:
         st.error("Erro ao salvar dados: " + str(e))
-
 
 # -----------------------------
 # COOKIES (LOGIN PERSISTENTE)
@@ -123,10 +119,8 @@ CAPITAIS_BRASILEIRAS = [
     "São Paulo-SP", "Aracaju-SE", "Palmas-TO"
 ]
 
-
 def cidade_eh_capital(cidade, uf):
     return f"{cidade}-{uf}" in CAPITAIS_BRASILEIRAS
-
 
 # -----------------------------
 # FUNÇÕES AUXILIARES (IBGE)
@@ -137,19 +131,16 @@ def carregar_estados():
     resp = requests.get(url)
     return sorted(resp.json(), key=lambda e: e["nome"])
 
-
 @st.cache_data
 def carregar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
     resp = requests.get(url)
     return sorted(resp.json(), key=lambda c: c["nome"])
 
-
 # -----------------------------
 # LOGIN
 # -----------------------------
 USUARIOS_FILE = "usuarios.json"
-
 
 def init_usuarios():
     try:
@@ -163,7 +154,6 @@ def init_usuarios():
         with open(USUARIOS_FILE, "w") as f:
             json.dump(usuarios, f, indent=4)
     return usuarios
-
 
 usuarios = init_usuarios()
 usuario_cookie = cookies.get("usuario", "")
@@ -206,10 +196,8 @@ choice = st.sidebar.radio("Menu", menu)
 def validar_telefone(tel):
     return re.match(r'^\(\d{2}\) \d{4,5}-\d{4}$', tel)
 
-
 def validar_email(email):
     return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email)
-
 
 # =============================
 # CADASTRO
@@ -286,13 +274,23 @@ elif choice == "Lista / Editar / Excluir":
                 nome_edit = st.text_input("Nome", dados.iloc[0]["Distribuidor"])
                 contato_edit = st.text_input("Contato", dados.iloc[0]["Contato"])
                 email_edit = st.text_input("Email", dados.iloc[0]["Email"])
+
+                # -------------------------------
+                # CORREÇÃO DA META — sempre mostra 0 se estiver vazia
+                # -------------------------------
+                try:
+                    meta_valor = float(str(dados.iloc[0]["Meta Mensal"]).replace(",", "."))
+                except:
+                    meta_valor = 0.0
+
                 meta_edit = st.number_input(
                     "Meta Mensal (R$)",
                     min_value=0.0,
                     step=100.0,
                     format="%.2f",
-                    value=float(dados.iloc[0]["Meta Mensal"]) if dados.iloc[0]["Meta Mensal"] != "" else 0.0
+                    value=meta_valor
                 )
+                # -------------------------------
 
                 estados_uniq = sorted(dados["Estado"].unique())
                 estado_edit = st.selectbox("Estado", estados_uniq, index=0)
@@ -322,7 +320,7 @@ elif choice == "Lista / Editar / Excluir":
                         if ocupadas:
                             st.error("\n".join(ocupadas))
                         else:
-                            # remover todas as linhas antigas
+                            # remover linhas antigas
                             st.session_state.df = st.session_state.df[
                                 st.session_state.df["Distribuidor"] != dist_edit
                             ]

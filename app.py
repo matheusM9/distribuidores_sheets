@@ -137,6 +137,7 @@ def carregar_cidades(uf):
     resp = requests.get(url)
     return sorted(resp.json(), key=lambda c: c["nome"])
 
+
 # -----------------------------
 # LOGIN
 # -----------------------------
@@ -187,7 +188,12 @@ if st.sidebar.button("Sair"):
 if "df" not in st.session_state:
     st.session_state.df = carregar_dados()
 
-menu = ["Cadastro", "Lista / Editar / Excluir"]
+# **************************************************
+# AQUI A PRIMEIRA ALTERAÇÃO PEDIDA:
+# **************************************************
+menu = ["Cadastro", "Lista / Editar / Excluir", "Dashboard Power BI"]
+# **************************************************
+
 choice = st.sidebar.radio("Menu", menu)
 
 # -----------------------------
@@ -198,6 +204,7 @@ def validar_telefone(tel):
 
 def validar_email(email):
     return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email)
+
 
 # =============================
 # CADASTRO
@@ -252,6 +259,7 @@ if choice == "Cadastro" and nivel_cookie == "editor":
 
                 st.success(f"Distribuidor '{nome}' cadastrado com sucesso!")
 
+
 # =============================
 # LISTA / EDITAR / EXCLUIR
 # =============================
@@ -276,7 +284,7 @@ elif choice == "Lista / Editar / Excluir":
                 email_edit = st.text_input("Email", dados.iloc[0]["Email"])
 
                 # -------------------------------
-                # CORREÇÃO DA META — sempre mostra 0 se estiver vazia
+                # CORREÇÃO DA META
                 # -------------------------------
                 try:
                     meta_valor = float(str(dados.iloc[0]["Meta Mensal"]).replace(",", "."))
@@ -320,7 +328,6 @@ elif choice == "Lista / Editar / Excluir":
                         if ocupadas:
                             st.error("\n".join(ocupadas))
                         else:
-                            # remover linhas antigas
                             st.session_state.df = st.session_state.df[
                                 st.session_state.df["Distribuidor"] != dist_edit
                             ]
@@ -355,3 +362,23 @@ elif choice == "Lista / Editar / Excluir":
                     salvar_dados(st.session_state.df)
                     st.session_state.df = carregar_dados()
                     st.success(f"Distribuidor '{dist_del}' removido!")
+
+
+# **************************************************
+# AQUI A SEGUNDA ALTERAÇÃO PEDIDA:
+# NOVA ABA COM O POWER BI
+# **************************************************
+elif choice == "Dashboard Power BI":
+
+    st.subheader("📊 Dashboard — Controle de Distribuidores")
+
+    st.markdown("""
+        <iframe title="Controle distribuidores" 
+                width="1140" 
+                height="600" 
+                src="https://app.powerbi.com/reportEmbed?reportId=59ef53ac-7e78-44be-9178-17671a3df153&autoAuth=true&ctid=95cdfec6-a550-49ed-99e4-8113bdae67fa" 
+                frameborder="0" 
+                allowFullScreen="true"></iframe>
+    """, unsafe_allow_html=True)
+
+# **************************************************

@@ -187,10 +187,8 @@ if st.sidebar.button("Sair"):
 if "df" not in st.session_state:
     st.session_state.df = carregar_dados()
 
-# -----------------------------
-# MENU — AQUI ADICIONEI “BUSCA”
-# -----------------------------
-menu = ["Cadastro", "Lista / Editar / Excluir", "Busca"]
+# NOVO MENU
+menu = ["Cadastro", "Lista / Editar / Excluir", "🔎 Buscar"]
 choice = st.sidebar.radio("Menu", menu)
 
 # -----------------------------
@@ -202,11 +200,11 @@ def validar_telefone(tel):
 def validar_email(email):
     return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email)
 
-
-# =====================================================================
-#  CADASTRO  (SEM MUDANÇAS, IGUAL AO SEU CÓDIGO)
-# =====================================================================
+# =============================
+# CADASTRO
+# =============================
 if choice == "Cadastro" and nivel_cookie == "editor":
+
     st.subheader("Cadastrar Novo Distribuidor")
 
     col1, col2 = st.columns(2)
@@ -255,10 +253,9 @@ if choice == "Cadastro" and nivel_cookie == "editor":
 
                 st.success(f"Distribuidor '{nome}' cadastrado com sucesso!")
 
-
-# =====================================================================
-# LISTA / EDITAR / EXCLUIR (SEM MUDANÇAS)
-# =====================================================================
+# =============================
+# LISTA / EDITAR / EXCLUIR
+# =============================
 elif choice == "Lista / Editar / Excluir":
 
     st.subheader("Distribuidores Cadastrados")
@@ -268,7 +265,7 @@ elif choice == "Lista / Editar / Excluir":
         use_container_width=True
     )
 
-    # ---------------------- EDITAR ----------------------
+    # EDITAR
     if nivel_cookie == "editor":
         with st.expander("✏️ Editar"):
             if not st.session_state.df.empty:
@@ -279,6 +276,9 @@ elif choice == "Lista / Editar / Excluir":
                 contato_edit = st.text_input("Contato", dados.iloc[0]["Contato"])
                 email_edit = st.text_input("Email", dados.iloc[0]["Email"])
 
+                # -------------------------------
+                # CORREÇÃO META
+                # -------------------------------
                 try:
                     meta_valor = float(str(dados.iloc[0]["Meta Mensal"]).replace(",", "."))
                 except:
@@ -291,6 +291,7 @@ elif choice == "Lista / Editar / Excluir":
                     format="%.2f",
                     value=meta_valor
                 )
+                # -------------------------------
 
                 estados_uniq = sorted(dados["Estado"].unique())
                 estado_edit = st.selectbox("Estado", estados_uniq, index=0)
@@ -327,8 +328,12 @@ elif choice == "Lista / Editar / Excluir":
                             novos = []
                             for cidade in cidades_novas:
                                 novos.append([
-                                    nome_edit, contato_edit, email_edit,
-                                    estado_edit, cidade, float(meta_edit)
+                                    nome_edit,
+                                    contato_edit,
+                                    email_edit,
+                                    estado_edit,
+                                    cidade,
+                                    float(meta_edit)
                                 ])
 
                             novo_df = pd.DataFrame(novos, columns=COLUNAS)
@@ -339,7 +344,7 @@ elif choice == "Lista / Editar / Excluir":
 
                             st.success("Alterações salvas!")
 
-        # ---------------------- EXCLUIR ----------------------
+        # EXCLUIR
         with st.expander("🗑️ Excluir"):
             if not st.session_state.df.empty:
                 dist_del = st.selectbox("Excluir distribuidor", st.session_state.df["Distribuidor"].unique())
@@ -351,29 +356,43 @@ elif choice == "Lista / Editar / Excluir":
                     st.session_state.df = carregar_dados()
                     st.success(f"Distribuidor '{dist_del}' removido!")
 
+# =============================
+# NOVA ABA ➜ BUSCAR
+# =============================
+elif choice == "🔎 Buscar":
 
-# =====================================================================
-# ⭐⭐⭐ NOVA ABA — BUSCA POR DISTRIBUIDOR OU CIDADE ⭐⭐⭐
-# =====================================================================
-elif choice == "Busca":
+    st.title("🔎 Buscar Distribuidor ou Cidade")
 
-    st.title("🔎 Buscar Distribuidor")
+    df = st.session_state.df
 
-    tipo = st.radio("Buscar por:", ["Distribuidor", "Cidade"])
+    modo = st.selectbox("Buscar por:", ["Distribuidor", "Cidade"])
 
-    termo = st.text_input("Digite o nome:", "")
+    # -----------------------------------------
+    # BUSCAR POR DISTRIBUIDOR
+    # -----------------------------------------
+    if modo == "Distribuidor":
 
-    if st.button("Buscar"):
+        lista_dists = sorted(df["Distribuidor"].unique())
+        dist_sel = st.selectbox("Selecione o distribuidor:", lista_dists)
 
-        df = st.session_state.df.copy()
+        dados = df[df["Distribuidor"] == dist_sel]
 
-        if tipo == "Distribuidor":
-            filtrado = df[df["Distribuidor"].str.contains(termo, case=False, na=False)]
+        st.subheader("Resultado:")
+        st.dataframe(dados, use_container_width=True)
+
+    # -----------------------------------------
+    # BUSCAR POR CIDADE
+    # -----------------------------------------
+    if modo == "Cidade":
+
+        lista_cidades = sorted(df["Cidade"].unique())
+
+        cidade_sel = st.selectbox("Digite ou escolha a cidade:", lista_cidades)
+
+        dados = df[df["Cidade"] == cidade_sel]
+
+        if dados.empty:
+            st.warning("⚠️ Não existe distribuidor cadastrado nesta cidade.")
         else:
-            filtrado = df[df["Cidade"].str.contains(termo, case=False, na=False)]
-
-        if filtrado.empty:
-            st.error("❌ Nenhum distribuidor encontrado para essa busca.")
-        else:
-            st.success(f"🔎 {len(filtrado)} registro(s) encontrado(s).")
-            st.dataframe(filtrado, use_container_width=True)
+            st.subheader("Distribuidor encontrado:")
+            st.dataframe(dados, use_container_width=True)

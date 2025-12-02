@@ -5,7 +5,6 @@
 import os
 import json
 import re
-import io
 import requests
 import pandas as pd
 import bcrypt
@@ -391,15 +390,7 @@ elif choice == "🔎 Buscar":
     if coluna_busca == "Cidade":
         todas_cidades = carregar_todas_cidades()  # formato: 'Cidade - UF'
 
-        # campo para digitar parte do nome e filtrar a lista grande
-        filtro_texto = st.text_input("Digite parte do nome da cidade para filtrar a lista (opcional):", "")
-        if filtro_texto:
-            sugestoes = [c for c in todas_cidades if filtro_texto.lower() in c.lower()]
-            if not sugestoes:
-                st.info("Nenhuma cidade encontrada com esse filtro.")
-            cidade_sel = st.selectbox("Selecione a cidade (filtrada):", sugestoes)
-        else:
-            cidade_sel = st.selectbox("Selecione a cidade (todas as cidades do Brasil):", todas_cidades)
+        cidade_sel = st.selectbox("Selecione a cidade (todas as cidades do Brasil):", todas_cidades)
 
         if st.button("Verificar cidade"):
             try:
@@ -408,41 +399,13 @@ elif choice == "🔎 Buscar":
                 nome_cidade = cidade_sel
                 uf = ""
 
-            # usar contains para permitir correspondência parcial por segurança
-            encontrados = df[
-                (df["Cidade"].str.lower().str.strip() == nome_cidade.lower().strip()) &
-                (df["Estado"].str.upper().str.strip() == uf.upper().strip())
-            ]
-
-            # fallback: se busca exata não encontrar, tentar contains (partial)
-            if encontrados.empty:
-                encontrados = df[
-                    (df["Cidade"].str.lower().str.contains(nome_cidade.lower().strip(), na=False)) &
-                    (df["Estado"].str.upper().str.strip() == uf.upper().strip())
-                ]
+            encontrados = df[(df["Cidade"].str.lower() == nome_cidade.lower()) & (df["Estado"].str.upper() == uf.upper())]
 
             if encontrados.empty:
                 st.error("❌ Não existe distribuidor para esta cidade.")
             else:
-                # garantir que Meta Mensal seja numérica para somar
-                def to_float_safe(x):
-                    try:
-                        return float(str(x).replace(",", "."))
-                    except:
-                        return 0.0
-
-                encontrados["Meta Mensal Num"] = encontrados["Meta Mensal"].apply(to_float_safe)
-                soma_meta = encontrados["Meta Mensal Num"].sum()
-
                 st.success(f"✅ {len(encontrados)} registro(s) encontrado(s) para {nome_cidade} - {uf}.")
-                st.metric("Meta Mensal total (R$)", f"R$ {soma_meta:,.2f}")
                 st.dataframe(encontrados[["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Meta Mensal"]], use_container_width=True)
-
-                # CSV export
-                csv_buffer = io.StringIO()
-                encontrados.to_csv(csv_buffer, index=False)
-                csv_bytes = csv_buffer.getvalue().encode("utf-8")
-                st.download_button("📥 Exportar resultados (CSV)", data=csv_bytes, file_name=f"busca_{nome_cidade}_{uf}.csv", mime="text/csv")
 
     # ----- BUSCAR POR DISTRIBUIDOR -----
     else:
@@ -450,40 +413,13 @@ elif choice == "🔎 Buscar":
         if not lista_dists:
             st.info("Nenhum distribuidor cadastrado ainda.")
         else:
-            # permitir busca por parte do nome
-            filtro_dist = st.text_input("Digite parte do nome do distribuidor para filtrar (opcional):", "")
-            if filtro_dist:
-                sugestoes_dist = [d for d in lista_dists if filtro_dist.lower() in d.lower()]
-                if not sugestoes_dist:
-                    st.info("Nenhum distribuidor encontrado com esse filtro.")
-                dist_sel = st.selectbox("Selecione o distribuidor (filtrado):", sugestoes_dist)
-            else:
-                dist_sel = st.selectbox("Selecione o distribuidor:", lista_dists)
-
+            dist_sel = st.selectbox("Selecione o distribuidor:", lista_dists)
             if dist_sel:
-                dados = df[df["Distribuidor"].str.lower().str.contains(dist_sel.lower(), na=False)]
-
+                dados = df[df["Distribuidor"].str.lower() == dist_sel.lower()]
                 if dados.empty:
                     st.error("Nenhum dado encontrado para este distribuidor.")
                 else:
-                    # soma metas
-                    def to_float_safe(x):
-                        try:
-                            return float(str(x).replace(",", "."))
-                        except:
-                            return 0.0
-
-                    dados["Meta Mensal Num"] = dados["Meta Mensal"].apply(to_float_safe)
-                    soma_meta = dados["Meta Mensal Num"].sum()
-
                     st.subheader(f"Cidades atendidas por {dist_sel}:")
-                    st.metric("Meta Mensal total (R$)", f"R$ {soma_meta:,.2f}")
                     st.dataframe(dados[["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Meta Mensal"]], use_container_width=True)
-
-                    # CSV export
-                    csv_buffer = io.StringIO()
-                    dados.to_csv(csv_buffer, index=False)
-                    csv_bytes = csv_buffer.getvalue().encode("utf-8")
-                    st.download_button("📥 Exportar resultados (CSV)", data=csv_bytes, file_name=f"busca_{dist_sel}.csv", mime="text/csv")
 
 # FIM DO ARQUIVO

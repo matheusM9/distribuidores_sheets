@@ -8,7 +8,6 @@ import re
 import requests
 import pandas as pd
 import bcrypt
-import io
 
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
@@ -25,7 +24,6 @@ st.set_page_config(page_title="Distribuidores", layout="wide")
 # -----------------------------
 SHEET_ID = "1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k"
 SHEET_NAME = "Página1"
-SHEET_CLASS_NAME = "Classificacoes"
 COLUNAS = ["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Meta Mensal"]
 
 # -----------------------------
@@ -37,10 +35,9 @@ SCOPE = [
 ]
 GC = None
 WORKSHEET = None
-WORKSHEET_CLASS = None
 
 def init_gsheets():
-    global GC, WORKSHEET, WORKSHEET_CLASS
+    global GC, WORKSHEET
     if "gcp_service_account" not in st.secrets:
         st.error("❌ Google Service Account não configurada nos Secrets do Streamlit Cloud.")
         st.stop()
@@ -49,18 +46,11 @@ def init_gsheets():
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
         GC = gspread.authorize(creds)
         sh = GC.open_by_key(SHEET_ID)
-        # main worksheet
         try:
             WORKSHEET = sh.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
-            WORKSHEET = sh.add_worksheet(title=SHEET_NAME, rows="2000", cols=str(len(COLUNAS)))
+            WORKSHEET = sh.add_worksheet(title=SHEET_NAME, rows="2000", cols="6")
             WORKSHEET.update([COLUNAS])
-        # classification worksheet
-        try:
-            WORKSHEET_CLASS = sh.worksheet(SHEET_CLASS_NAME)
-        except gspread.WorksheetNotFound:
-            WORKSHEET_CLASS = sh.add_worksheet(title=SHEET_CLASS_NAME, rows="2000", cols="3")
-            WORKSHEET_CLASS.update([["Cidade","Estado","Classificacao"]])
     except (DefaultCredentialsError, RefreshError, Exception) as e:
         st.error("Erro ao autenticar Google Sheets. Verifique o Secret da Service Account.\n" + str(e))
         st.stop()
@@ -77,6 +67,7 @@ def carregar_dados():
     except Exception as e:
         st.error("Erro ao ler planilha: " + str(e))
         return pd.DataFrame(columns=COLUNAS)
+
     if not records:
         df = pd.DataFrame(columns=COLUNAS)
         try:
@@ -85,6 +76,7 @@ def carregar_dados():
         except:
             pass
         return df
+
     df = pd.DataFrame(records)
     for col in COLUNAS:
         if col not in df.columns:
@@ -95,64 +87,16 @@ def salvar_dados(df):
     try:
         df2 = df.copy()
         df2 = df2[COLUNAS].fillna("")
-        # write back (overwrite)
         WORKSHEET.clear()
         WORKSHEET.update([df2.columns.values.tolist()] + df2.values.tolist())
+
         try:
             st.cache_data.clear()
         except:
             pass
+
     except Exception as e:
         st.error("Erro ao salvar dados: " + str(e))
-
-# -----------------------------
-# CLASSIFICAÇÕES (sheet separada)
-# -----------------------------
-@st.cache_data(ttl=60)
-def carregar_classificacoes():
-    try:
-        recs = WORKSHEET_CLASS.get_all_records()
-    except Exception as e:
-        # se erro, retorna DF vazio com colunas
-        return pd.DataFrame(columns=["Cidade","Estado","Classificacao"])
-    dfc = pd.DataFrame(recs)
-    # garantir colunas
-    for c in ["Cidade","Estado","Classificacao"]:
-        if c not in dfc.columns:
-            dfc[c] = ""
-    return dfc
-
-def salvar_classificacao_entry(cidade, estado, classificacao):
-    # upsert na folha Classificacoes
-    dfc = carregar_classificacoes()
-    # procurar correspondência exata (cidade+estado)
-    mask = (dfc["Cidade"].str.lower().str.strip() == cidade.lower().strip()) & (dfc["Estado"].str.upper().str_strip() == estado.upper().strip()) if ("str_strip" in dir(str)) else (dfc["Cidade"].str.lower().str.strip() == cidade.lower().strip()) & (dfc["Estado"].str.upper().str.strip() == estado.upper().strip())
-    # Python versions differ on string functions; use safe approach:
-    mask = (dfc["Cidade"].astype(str).str.lower().str.strip() == cidade.lower().strip()) & (dfc["Estado"].astype(str).str.upper().str.strip() == estado.upper().strip())
-    if mask.any():
-        dfc.loc[mask, "Classificacao"] = classificacao
-    else:
-        dfc = pd.concat([dfc, pd.DataFrame([[cidade, estado, classificacao]], columns=["Cidade","Estado","Classificacao"])], ignore_index=True)
-    # write back
-    WORKSHEET_CLASS.clear()
-    WORKSHEET_CLASS.update([dfc.columns.values.tolist()] + dfc.values.tolist())
-    try:
-        st.cache_data.clear()
-    except:
-        pass
-
-def get_classificacao(cidade, estado):
-    # retorna classificacao para cidade+estado. se não existir -> 'Caráter Exclusivo'
-    dfc = carregar_classificacoes()
-    if dfc.empty:
-        return "Caráter Exclusivo"
-    cidade = str(cidade).strip()
-    estado = str(estado).strip().upper()
-    match = dfc[(dfc["Cidade"].astype(str).str.lower().str.strip() == cidade.lower()) & (dfc["Estado"].astype(str).str.upper().str.strip() == estado.upper())]
-    if not match.empty:
-        val = str(match.iloc[0]["Classificacao"]).strip()
-        return val if val else "Caráter Exclusivo"
-    return "Caráter Exclusivo"
 
 # -----------------------------
 # COOKIES (LOGIN PERSISTENTE)
@@ -259,8 +203,8 @@ if st.sidebar.button("Sair"):
 if "df" not in st.session_state:
     st.session_state.df = carregar_dados()
 
-# NOVO MENU (inclui Classificação)
-menu = ["Cadastro", "Lista / Editar / Excluir", "🔎 Buscar", "Classificação de Cidade"]
+# NOVO MENU
+menu = ["Cadastro", "Lista / Editar / Excluir", "🔎 Buscar"]
 choice = st.sidebar.radio("Menu", menu)
 
 # -----------------------------
@@ -271,13 +215,6 @@ def validar_telefone(tel):
 
 def validar_email(email):
     return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email)
-
-# helpers
-def to_float_safe(x):
-    try:
-        return float(str(x).replace(",", "."))
-    except:
-        return 0.0
 
 # =============================
 # CADASTRO
@@ -312,13 +249,7 @@ if choice == "Cadastro" and nivel_cookie == "editor":
             st.error("Distribuidor já existe!")
         else:
             cidades_ocupadas = []
-            # verificar por cada cidade a classificação
             for c in cidades_sel:
-                classificacao = get_classificacao(c, estado_sel)
-                # se classificação permite múltiplos, não bloquear
-                if classificacao in ["Área Aberta", "Área Aberta Cliente Fechado"]:
-                    continue
-                # senão respeitar regra antiga (não permitir se cidade já tem distribuidor e não for capital)
                 if c in st.session_state.df["Cidade"].tolist() and not cidade_eh_capital(c, estado_sel):
                     dist_exist = st.session_state.df.loc[st.session_state.df["Cidade"] == c, "Distribuidor"].iloc[0]
                     cidades_ocupadas.append(f"{c} (pertence a {dist_exist})")
@@ -399,10 +330,6 @@ elif choice == "Lista / Editar / Excluir":
                         ocupadas = []
 
                         for cidade in cidades_novas:
-                            classificacao = get_classificacao(cidade, estado_edit)
-                            # se classificação permite múltiplos, ignora ocupação
-                            if classificacao in ["Área Aberta", "Área Aberta Cliente Fechado"]:
-                                continue
                             if cidade in outras["Cidade"].tolist() and not cidade_eh_capital(cidade, estado_edit):
                                 de = outras.loc[outras["Cidade"] == cidade, "Distribuidor"].iloc[0]
                                 ocupadas.append(f"{cidade} pertence a {de}")
@@ -410,7 +337,7 @@ elif choice == "Lista / Editar / Excluir":
                         if ocupadas:
                             st.error("\n".join(ocupadas))
                         else:
-                            # remover linhas antigas do distribuidor sendo editado
+                            # remover linhas antigas
                             st.session_state.df = st.session_state.df[
                                 st.session_state.df["Distribuidor"] != dist_edit
                             ]
@@ -463,15 +390,7 @@ elif choice == "🔎 Buscar":
     if coluna_busca == "Cidade":
         todas_cidades = carregar_todas_cidades()  # formato: 'Cidade - UF'
 
-        # campo para digitar parte do nome e filtrar a lista grande
-        filtro_texto = st.text_input("Digite parte do nome da cidade para filtrar a lista (opcional):", "")
-        if filtro_texto:
-            sugestoes = [c for c in todas_cidades if filtro_texto.lower() in c.lower()]
-            if not sugestoes:
-                st.info("Nenhuma cidade encontrada com esse filtro.")
-            cidade_sel = st.selectbox("Selecione a cidade (filtrada):", sugestoes)
-        else:
-            cidade_sel = st.selectbox("Selecione a cidade (todas as cidades do Brasil):", todas_cidades)
+        cidade_sel = st.selectbox("Selecione a cidade (todas as cidades do Brasil):", todas_cidades)
 
         if st.button("Verificar cidade"):
             try:
@@ -480,34 +399,13 @@ elif choice == "🔎 Buscar":
                 nome_cidade = cidade_sel
                 uf = ""
 
-            # usar contains para permitir correspondência parcial por segurança
-            encontrados = df[
-                (df["Cidade"].str.lower().str.strip() == nome_cidade.lower().strip()) &
-                (df["Estado"].str.upper().str.strip() == uf.upper().strip())
-            ]
-
-            # fallback: se busca exata não encontrar, tentar contains (partial)
-            if encontrados.empty:
-                encontrados = df[
-                    (df["Cidade"].str.lower().str.contains(nome_cidade.lower().strip(), na=False)) &
-                    (df["Estado"].str.upper().str.strip() == uf.upper().strip())
-                ]
+            encontrados = df[(df["Cidade"].str.lower() == nome_cidade.lower()) & (df["Estado"].str.upper() == uf.upper())]
 
             if encontrados.empty:
                 st.error("❌ Não existe distribuidor para esta cidade.")
             else:
-                encontrados["Meta Mensal Num"] = encontrados["Meta Mensal"].apply(to_float_safe)
-                soma_meta = encontrados["Meta Mensal Num"].sum()
-
                 st.success(f"✅ {len(encontrados)} registro(s) encontrado(s) para {nome_cidade} - {uf}.")
-                st.metric("Meta Mensal total (R$)", f"R$ {soma_meta:,.2f}")
                 st.dataframe(encontrados[["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Meta Mensal"]], use_container_width=True)
-
-                # CSV export
-                csv_buffer = io.StringIO()
-                encontrados.to_csv(csv_buffer, index=False)
-                csv_bytes = csv_buffer.getvalue().encode("utf-8")
-                st.download_button("📥 Exportar resultados (CSV)", data=csv_bytes, file_name=f"busca_{nome_cidade}_{uf}.csv", mime="text/csv")
 
     # ----- BUSCAR POR DISTRIBUIDOR -----
     else:
@@ -515,83 +413,13 @@ elif choice == "🔎 Buscar":
         if not lista_dists:
             st.info("Nenhum distribuidor cadastrado ainda.")
         else:
-            # permitir busca por parte do nome
-            filtro_dist = st.text_input("Digite parte do nome do distribuidor para filtrar (opcional):", "")
-            if filtro_dist:
-                sugestoes_dist = [d for d in lista_dists if filtro_dist.lower() in d.lower()]
-                if not sugestoes_dist:
-                    st.info("Nenhum distribuidor encontrado com esse filtro.")
-                dist_sel = st.selectbox("Selecione o distribuidor (filtrado):", sugestoes_dist)
-            else:
-                dist_sel = st.selectbox("Selecione o distribuidor:", lista_dists)
-
+            dist_sel = st.selectbox("Selecione o distribuidor:", lista_dists)
             if dist_sel:
-                dados = df[df["Distribuidor"].str.lower().str.contains(dist_sel.lower(), na=False)]
-
+                dados = df[df["Distribuidor"].str.lower() == dist_sel.lower()]
                 if dados.empty:
                     st.error("Nenhum dado encontrado para este distribuidor.")
                 else:
-                    dados["Meta Mensal Num"] = dados["Meta Mensal"].apply(to_float_safe)
-                    soma_meta = dados["Meta Mensal Num"].sum()
-
                     st.subheader(f"Cidades atendidas por {dist_sel}:")
-                    st.metric("Meta Mensal total (R$)", f"R$ {soma_meta:,.2f}")
                     st.dataframe(dados[["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Meta Mensal"]], use_container_width=True)
-
-                    # CSV export
-                    csv_buffer = io.StringIO()
-                    dados.to_csv(csv_buffer, index=False)
-                    csv_bytes = csv_buffer.getvalue().encode("utf-8")
-                    st.download_button("📥 Exportar resultados (CSV)", data=csv_bytes, file_name=f"busca_{dist_sel}.csv", mime="text/csv")
-
-# =============================
-# NOVA ABA ➜ CLASSIFICAÇÃO DE CIDADES
-# =============================
-elif choice == "Classificação de Cidade":
-
-    st.title("🏷️ Classificação de Cidades")
-
-    # carregar classificações e cidades
-    df = st.session_state.df.copy()
-    dfc = carregar_classificacoes()
-
-    todas_cidades = carregar_todas_cidades()  # formato 'Cidade - UF'
-
-    st.markdown("Escolha uma cidade (ou filtre pelo nome) e altere sua classificação.\
-                 \n\nClassificações possíveis:\n\n- Área Aberta\n- Área Aberta Cliente Fechado\n- Liberado Primeira Venda\n- Caráter Exclusivo (padrão)")
-
-    filtro_c = st.text_input("Filtrar cidades (parte do nome):", "")
-    if filtro_c:
-        sugest = [c for c in todas_cidades if filtro_c.lower() in c.lower()]
-    else:
-        sugest = todas_cidades
-
-    cidade_sel = st.selectbox("Cidade:", sugest)
-
-    if cidade_sel:
-        try:
-            nome_cidade, uf = [s.strip() for s in cidade_sel.rsplit(" - ", 1)]
-        except:
-            nome_cidade = cidade_sel
-            uf = ""
-
-        # identificar classificação atual
-        atual = get_classificacao(nome_cidade, uf)
-
-        opcoes_class = ["Área Aberta", "Área Aberta Cliente Fechado", "Liberado Primeira Venda", "Caráter Exclusivo"]
-        nova_class = st.selectbox("Classificação:", opcoes_class, index=opcoes_class.index(atual) if atual in opcoes_class else opcoes_class.index("Caráter Exclusivo"))
-
-        st.write(f"Classificação atual: **{atual}**")
-
-        if st.button("Salvar Classificação"):
-            salvar_classificacao_entry(nome_cidade, uf, nova_class)
-            st.success("Classificação salva com sucesso!")
-            # recarregar cache
-            st.experimental_rerun()
-
-    # Mostrar tabela de classificações existente (opcional)
-    if not dfc.empty:
-        st.subheader("Classificações registradas")
-        st.dataframe(dfc, use_container_width=True)
 
 # FIM DO ARQUIVO

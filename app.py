@@ -132,10 +132,26 @@ def carregar_estados():
     return sorted(resp.json(), key=lambda e: e["nome"])
 
 @st.cache_data
-def carregar_cidades(uf):
+def carregar_cidades_por_uf(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
     resp = requests.get(url)
     return sorted(resp.json(), key=lambda c: c["nome"])
+
+@st.cache_data(ttl=24*60*60)
+def carregar_todas_cidades():
+    """Retorna lista com 'Cidade - UF' para todas as cidades do Brasil (cache de 24h)."""
+    estados = carregar_estados()
+    todas = []
+    for e in estados:
+        sigla = e["sigla"]
+        try:
+            municipios = carregar_cidades_por_uf(sigla)
+            for m in municipios:
+                todas.append(f"{m['nome']} - {sigla}")
+        except:
+            # se alguma falha na API, ignora
+            pass
+    return sorted(todas)
 
 # -----------------------------
 # LOGIN
@@ -212,7 +228,7 @@ if choice == "Cadastro" and nivel_cookie == "editor":
         estados = carregar_estados()
         siglas = [e["sigla"] for e in estados]
         estado_sel = st.selectbox("Estado", siglas)
-        cidades = [c["nome"] for c in carregar_cidades(estado_sel)]
+        cidades = [c["nome"] for c in carregar_cidades_por_uf(estado_sel)]
         cidades_sel = st.multiselect("Cidades", cidades)
 
     with col2:
@@ -277,7 +293,7 @@ elif choice == "Lista / Editar / Excluir":
                 email_edit = st.text_input("Email", dados.iloc[0]["Email"])
 
                 # -------------------------------
-                # CORREÇÃO META
+                # CORREÇÃO DA META — sempre mostra 0 se estiver vazia
                 # -------------------------------
                 try:
                     meta_valor = float(str(dados.iloc[0]["Meta Mensal"]).replace(",", "."))
@@ -296,7 +312,7 @@ elif choice == "Lista / Editar / Excluir":
                 estados_uniq = sorted(dados["Estado"].unique())
                 estado_edit = st.selectbox("Estado", estados_uniq, index=0)
 
-                cidades_disponiveis = [c["nome"] for c in carregar_cidades(estado_edit)]
+                cidades_disponiveis = [c["nome"] for c in carregar_cidades_por_uf(estado_edit)]
                 cidades_novas = st.multiselect(
                     "Cidades",
                     cidades_disponiveis,
@@ -321,6 +337,7 @@ elif choice == "Lista / Editar / Excluir":
                         if ocupadas:
                             st.error("\n".join(ocupadas))
                         else:
+                            # remover linhas antigas
                             st.session_state.df = st.session_state.df[
                                 st.session_state.df["Distribuidor"] != dist_edit
                             ]
@@ -357,42 +374,52 @@ elif choice == "Lista / Editar / Excluir":
                     st.success(f"Distribuidor '{dist_del}' removido!")
 
 # =============================
-# NOVA ABA ➜ BUSCAR
+# NOVA ABA ➜ BUSCAR (OPÇÃO C: cidade + distribuidor)
 # =============================
 elif choice == "🔎 Buscar":
 
     st.title("🔎 Buscar Distribuidor ou Cidade")
 
-    df = st.session_state.df
+    df = st.session_state.df.copy()
 
-    modo = st.selectbox("Buscar por:", ["Distribuidor", "Cidade"])
+    st.markdown("Escolha se deseja buscar por **Cidade** (todas as cidades do Brasil) ou por **Distribuidor** cadastrado.")
 
-    # -----------------------------------------
-    # BUSCAR POR DISTRIBUIDOR
-    # -----------------------------------------
-    if modo == "Distribuidor":
+    coluna_busca = st.selectbox("Buscar por:", ["Cidade", "Distribuidor"])
 
-        lista_dists = sorted(df["Distribuidor"].unique())
-        dist_sel = st.selectbox("Selecione o distribuidor:", lista_dists)
+    # ----- BUSCAR POR CIDADE (todas cidades do Brasil) -----
+    if coluna_busca == "Cidade":
+        todas_cidades = carregar_todas_cidades()  # formato: 'Cidade - UF'
 
-        dados = df[df["Distribuidor"] == dist_sel]
+        cidade_sel = st.selectbox("Selecione a cidade (todas as cidades do Brasil):", todas_cidades)
 
-        st.subheader("Resultado:")
-        st.dataframe(dados, use_container_width=True)
+        if st.button("Verificar cidade"):
+            try:
+                nome_cidade, uf = [s.strip() for s in cidade_sel.rsplit(" - ", 1)]
+            except:
+                nome_cidade = cidade_sel
+                uf = ""
 
-    # -----------------------------------------
-    # BUSCAR POR CIDADE
-    # -----------------------------------------
-    if modo == "Cidade":
+            encontrados = df[(df["Cidade"].str.lower() == nome_cidade.lower()) & (df["Estado"].str.upper() == uf.upper())]
 
-        lista_cidades = sorted(df["Cidade"].unique())
+            if encontrados.empty:
+                st.error("❌ Não existe distribuidor para esta cidade.")
+            else:
+                st.success(f"✅ {len(encontrados)} registro(s) encontrado(s) para {nome_cidade} - {uf}.")
+                st.dataframe(encontrados[["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Meta Mensal"]], use_container_width=True)
 
-        cidade_sel = st.selectbox("Digite ou escolha a cidade:", lista_cidades)
-
-        dados = df[df["Cidade"] == cidade_sel]
-
-        if dados.empty:
-            st.warning("⚠️ Não existe distribuidor cadastrado nesta cidade.")
+    # ----- BUSCAR POR DISTRIBUIDOR -----
+    else:
+        lista_dists = sorted(df["Distribuidor"].dropna().unique())
+        if not lista_dists:
+            st.info("Nenhum distribuidor cadastrado ainda.")
         else:
-            st.subheader("Distribuidor encontrado:")
-            st.dataframe(dados, use_container_width=True)
+            dist_sel = st.selectbox("Selecione o distribuidor:", lista_dists)
+            if dist_sel:
+                dados = df[df["Distribuidor"].str.lower() == dist_sel.lower()]
+                if dados.empty:
+                    st.error("Nenhum dado encontrado para este distribuidor.")
+                else:
+                    st.subheader(f"Cidades atendidas por {dist_sel}:")
+                    st.dataframe(dados[["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Meta Mensal"]], use_container_width=True)
+
+# FIM DO ARQUIVO

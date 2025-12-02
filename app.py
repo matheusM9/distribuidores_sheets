@@ -187,7 +187,10 @@ if st.sidebar.button("Sair"):
 if "df" not in st.session_state:
     st.session_state.df = carregar_dados()
 
-menu = ["Cadastro", "Lista / Editar / Excluir"]
+# -----------------------------
+# MENU — AQUI ADICIONEI “BUSCA”
+# -----------------------------
+menu = ["Cadastro", "Lista / Editar / Excluir", "Busca"]
 choice = st.sidebar.radio("Menu", menu)
 
 # -----------------------------
@@ -199,11 +202,11 @@ def validar_telefone(tel):
 def validar_email(email):
     return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email)
 
-# =============================
-# CADASTRO
-# =============================
-if choice == "Cadastro" and nivel_cookie == "editor":
 
+# =====================================================================
+#  CADASTRO  (SEM MUDANÇAS, IGUAL AO SEU CÓDIGO)
+# =====================================================================
+if choice == "Cadastro" and nivel_cookie == "editor":
     st.subheader("Cadastrar Novo Distribuidor")
 
     col1, col2 = st.columns(2)
@@ -252,9 +255,10 @@ if choice == "Cadastro" and nivel_cookie == "editor":
 
                 st.success(f"Distribuidor '{nome}' cadastrado com sucesso!")
 
-# =============================
-# LISTA / EDITAR / EXCLUIR
-# =============================
+
+# =====================================================================
+# LISTA / EDITAR / EXCLUIR (SEM MUDANÇAS)
+# =====================================================================
 elif choice == "Lista / Editar / Excluir":
 
     st.subheader("Distribuidores Cadastrados")
@@ -264,7 +268,7 @@ elif choice == "Lista / Editar / Excluir":
         use_container_width=True
     )
 
-    # EDITAR
+    # ---------------------- EDITAR ----------------------
     if nivel_cookie == "editor":
         with st.expander("✏️ Editar"):
             if not st.session_state.df.empty:
@@ -275,9 +279,6 @@ elif choice == "Lista / Editar / Excluir":
                 contato_edit = st.text_input("Contato", dados.iloc[0]["Contato"])
                 email_edit = st.text_input("Email", dados.iloc[0]["Email"])
 
-                # -------------------------------
-                # CORREÇÃO DA META — sempre mostra 0 se estiver vazia
-                # -------------------------------
                 try:
                     meta_valor = float(str(dados.iloc[0]["Meta Mensal"]).replace(",", "."))
                 except:
@@ -290,7 +291,6 @@ elif choice == "Lista / Editar / Excluir":
                     format="%.2f",
                     value=meta_valor
                 )
-                # -------------------------------
 
                 estados_uniq = sorted(dados["Estado"].unique())
                 estado_edit = st.selectbox("Estado", estados_uniq, index=0)
@@ -320,7 +320,6 @@ elif choice == "Lista / Editar / Excluir":
                         if ocupadas:
                             st.error("\n".join(ocupadas))
                         else:
-                            # remover linhas antigas
                             st.session_state.df = st.session_state.df[
                                 st.session_state.df["Distribuidor"] != dist_edit
                             ]
@@ -328,12 +327,8 @@ elif choice == "Lista / Editar / Excluir":
                             novos = []
                             for cidade in cidades_novas:
                                 novos.append([
-                                    nome_edit,
-                                    contato_edit,
-                                    email_edit,
-                                    estado_edit,
-                                    cidade,
-                                    float(meta_edit)
+                                    nome_edit, contato_edit, email_edit,
+                                    estado_edit, cidade, float(meta_edit)
                                 ])
 
                             novo_df = pd.DataFrame(novos, columns=COLUNAS)
@@ -344,7 +339,7 @@ elif choice == "Lista / Editar / Excluir":
 
                             st.success("Alterações salvas!")
 
-        # EXCLUIR
+        # ---------------------- EXCLUIR ----------------------
         with st.expander("🗑️ Excluir"):
             if not st.session_state.df.empty:
                 dist_del = st.selectbox("Excluir distribuidor", st.session_state.df["Distribuidor"].unique())
@@ -355,3 +350,30 @@ elif choice == "Lista / Editar / Excluir":
                     salvar_dados(st.session_state.df)
                     st.session_state.df = carregar_dados()
                     st.success(f"Distribuidor '{dist_del}' removido!")
+
+
+# =====================================================================
+# ⭐⭐⭐ NOVA ABA — BUSCA POR DISTRIBUIDOR OU CIDADE ⭐⭐⭐
+# =====================================================================
+elif choice == "Busca":
+
+    st.title("🔎 Buscar Distribuidor")
+
+    tipo = st.radio("Buscar por:", ["Distribuidor", "Cidade"])
+
+    termo = st.text_input("Digite o nome:", "")
+
+    if st.button("Buscar"):
+
+        df = st.session_state.df.copy()
+
+        if tipo == "Distribuidor":
+            filtrado = df[df["Distribuidor"].str.contains(termo, case=False, na=False)]
+        else:
+            filtrado = df[df["Cidade"].str.contains(termo, case=False, na=False)]
+
+        if filtrado.empty:
+            st.error("❌ Nenhum distribuidor encontrado para essa busca.")
+        else:
+            st.success(f"🔎 {len(filtrado)} registro(s) encontrado(s).")
+            st.dataframe(filtrado, use_container_width=True)
